@@ -1249,15 +1249,21 @@ def render_diet_day(uid: int, day_idx: int):
     text += "━━━━━━━━━━━━━━━\n\n"
 
     kb = []
-    for m_idx, m in enumerate(meals):
+        for m_idx, m in enumerate(meals):
+        m_num = m.get("num", m_idx + 1)
+        m_title = m.get("title") or m.get("name") or "Прием пищи"
+        m_weight = m.get("weight") or m.get("grams") or "—"
+        m_p = m.get("p", m.get("b", 0))
+        m_f = m.get("f", m.get("j", 0))
+        m_c = m.get("c", m.get("u", 0))
         text += (
-            f"🍽 **{m['num']}. {m['title']}**\n"
-            f"⚖️ Порция: {m['weight']}\n"
-            f"📊 Б: {m['p']}г | Ж: {m['f']}г | У: {m['c']}г\n\n"
+            f"🍽 **{m_num}. {m_title}**\n"
+            f"⚖️ Порция: {m_weight}\n"
+            f"📊 Б: {m_p}г | Ж: {m_f}г | У: {m_c}г\n\n"
         )
         kb.append([
-            InlineKeyboardButton(text=f"📖 Рецепт #{m['num']}", callback_data=f"recipe_{day_idx}_{m_idx}"),
-            InlineKeyboardButton(text=f"🔄 Заменить #{m['num']}", callback_data=f"repmeal_{day_idx}_{m_idx}")
+            InlineKeyboardButton(text=f"📖 Рецепт #{m_num}", callback_data=f"recipe_{day_idx}_{m_idx}"),
+            InlineKeyboardButton(text=f"🔄 Заменить #{m_num}", callback_data=f"repmeal_{day_idx}_{m_idx}")
         ])
 
     # Кнопки внизу — строго числа месяца (например 14, 15, 16...) в соответствии с рационом
