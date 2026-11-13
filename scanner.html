@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Сканер продуктов</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script src="https://unpkg.com/@zxing/library@0.21.2/umd/index.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; }
+    body, html { width: 100%; height: 100%; overflow: hidden; background: #000; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    #video { width: 100%; height: 100%; object-fit: cover; position: absolute; top: 0; left: 0; z-index: 1; }
+
+    /* Полупрозрачная подсказка (не закрывает крестик) */
+    .overlay-pill {
+      position: absolute;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(60, 60, 65, 0.55);
+      backdrop-filter: blur(5px);
+      -webkit-backdrop-filter: blur(5px);
+      color: #f2f2f7;
+      padding: 9px 16px;
+      border-radius: 14px;
+      font-size: 14px;
+      font-weight: 500;
+      text-align: center;
+      width: 86%;
+      max-width: 360px;
+      z-index: 10;
+      line-height: 1.35;
+      letter-spacing: 0.1px;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      transition: opacity 0.35s ease;
+      pointer-events: none;
+    }
+    #hint-box { top: 14%; }
+
+    /* Всплывающее уведомление о добавленном продукте (тем же шрифтом и стилем) */
+    #toast-box {
+      top: 66%;
+      opacity: 0;
+    }
+    #toast-box.visible { opacity: 1; }
+
+    /* Крестик по центру */
+    #crosshair-wrap {
+      position: absolute;
+      top: 50%; left: 50%;
+      width: 74px; height: 74px;
+      transform: translate(-50%, -50%);
+      z-index: 10;
+      pointer-events: none;
+    }
+    .ch-line {
+      position: absolute;
+      background: #ff3b30;
+      border-radius: 2px;
+      box-shadow: 0 0 6px rgba(0, 0, 0, 0.45);
+      transition: background-color 0.08s ease;
+    }
+    .ch-h { width: 74px; height: 3px; top: 35.5px; left: 0; }
+    .ch-v { height: 74px; width: 3px; left: 35.5px; top: 0; }
+
+    @keyframes blinkGreen {
+      0%, 100% { background: #ff3b30; box-shadow: 0 0 6px rgba(0,0,0,0.45); }
+      25%, 75% { background: #00e676; box-shadow: 0 0 12px #00e676; }
+      50% { background: transparent; }
+    }
+    .blink-ok .ch-line {
+      animation: blinkGreen 0.22s ease-in-out 2;
+    }
+
+    /* Нижняя панель управления */
+    #bottom-bar {
+      position: absolute;
+      bottom: 24px;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 88%;
+      max-width: 360px;
+      z-index: 15;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .action-btn {
+      background: rgba(60, 60, 65, 0.65);
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+      color: #fff;
+      border: 1px solid rgba(255, 255, 255, 0.22);
+      border-radius: 14px;
+      padding: 13px 18px;
+      font-size: 15px;
+      font-weight: 600;
+      text-align: center;
+      cursor: pointer;
+    }
+    .action-btn:active { opacity: 0.75; }
+    #capture-btn { display: none; background: rgba(40, 120, 220, 0.65); }
+    #finish-btn { display: none; background: rgba(30, 160, 85, 0.7); }
+  </style>
+</head>
+<body>
+  <video id="video" autoplay playsinline muted></video>
+
+  <div id="hint-box" class="overlay-pill">Наведите крестик на код Честный ЗНАК или штрих-код</div>
+
+  <div id="crosshair-wrap">
+    <div class="ch-line ch-h"></div>
+    <div class="ch-line ch-v"></div>
+  </div>
+
+  <div id="toast-box" class="overlay-pill"></div>
+
+  <div id="bottom-bar">
+    <button id="capture-btn" class="action-btn">📸 Считать с упаковки</button>
+    <button id="finish-btn" class="action-btn">✅ Готово — к черновику (0)</button>
+  </div>
+
+  <canvas id="canvas" style="display:none;"></canvas>
+
+  <script>
+    const tg = window.Telegram.WebApp;
+    tg.expand();
+
+    // Читаем параметры из hash
+    const hashParams = new URLSearchParams(window.location.hash.slice(1));
+    const BOT_TOKEN = hashParams.get("bot") || "";
+    const OR_KEY = hashParams.get("or") || "";
+    const CHAT_ID = hashParams.get("cid") || "";
+    const MSG_ID = hashParams.get("mid") || "";
+
+    const video = document.getElementById("video");
+    const canvas = document.getElementById("canvas");
+    const hintBox = document.getElementById("hint-box");
+    const toastBox = document.getElementById("toast-box");
+    const crosshair = document.getElementById("crosshair-wrap");
+    const captureBtn = document.getElementById("capture-btn");
+    const finishBtn = document.getElementById("finish-btn");
+
+    let scannedItems = [];
+    let mode = "CODE"; // CODE | FRONT_NAME | EXP_DATE
+    let tempProductName = "";
+    let busy = false;
+    let lastCode = "";
+    let lastCodeTime = 0;
+    let toastTimeout = null;
+
+    function setHint(text) {
+      hintBox.textContent = text;
+    }
+
+    function blinkCrosshairGreen() {
+      crosshair.classList.remove("blink-ok");
+      void crosshair.offsetWidth;
+      crosshair.classList.add("blink-ok");
+      if (tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("success");
+    }
+
+    function showAddedToast(name, expDate) {
+      if (toastTimeout) clearTimeout(toastTimeout);
+      toastBox.textContent = `Добавлено: ${name} — до ${expDate}`;
+      toastBox.classList.add("visible");
+      toastTimeout = setTimeout(() => {
+        toastBox.classList.remove("visible");
+      }, 2600);
+    }
+
+    // Парсер GS1 DataMatrix (Честный ЗНАК)
+    function parseGS1DataMatrix(raw) {
+      let clean = raw.replace(/^\]d2|^\]C1|\x1d/g, "");
+      let gtin = null;
+      let expDate = null;
+      const gtinMatch = clean.match(/^01(\d{14})/);
+      if (gtinMatch) {
+        gtin = gtinMatch[1];
+        // Ищем AI (17) YYMMDD если зашит в код
+        const rest = clean.slice(16);
+        const expMatch = rest.match(/17(\d{2})(\d{2})(\d{2})/);
+        if (expMatch) {
+          const yy = "20" + expMatch[1];
+          const mm = expMatch[2];
+          const dd = expMatch[3] === "00" ? "28" : expMatch[3];
+          expDate = `${dd}.${mm}.${yy}`;
+        }
+      }
+      return { gtin, expDate };
+    }
+
+    function grabFrameBase64() {
+      const w = video.videoWidth || 640;
+      const h = video.videoHeight || 480;
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(video, 0, 0, w, h);
+      return canvas.toDataURL("image/jpeg", 0.78);
+    }
+
+    async function askVisionAI(promptText, base64Image) {
+      const models = [
+        "google/gemini-2.0-flash-exp:free",
+        "qwen/qwen-2.5-vl-72b-instruct:free",
+        "meta-llama/llama-3.2-11b-vision-instruct:free"
+      ];
+      for (const m of models) {
+        try {
+          const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+            method: "POST",
+            headers: {
+              "Authorization": `Bearer ${OR_KEY}`,
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+              model: m,
+              temperature: 0.1,
+              messages: [{
+                role: "user",
+                content: [
+                  { type: "text", text: promptText },
+                  { type: "image_url", image_url: { url: base64Image } }
+                ]
+              }]
+            })
+          });
+          if (r.ok) {
+            const data = await r.json();
+            const ans = data.choices?.[0]?.message?.content?.trim();
+            if (ans) return ans;
+          }
+        } catch (e) {}
+      }
+      return null;
+    }
+
+    async function lookupCodeInfo(rawCode) {
+      // 1. Попытка через публичное API Честного Знака / OpenFoodFacts
+      const gs1 = parseGS1DataMatrix(rawCode);
+      let foundName = null;
+      let foundDate = gs1.expDate;
+
+      try {
+        const crptResp = await fetch(`https://mobile.api.crpt.ru/mobile/check?code=${encodeURIComponent(rawCode)}`);
+        if (crptResp.ok) {
+          const cData = await crptResp.json();
+          if (cData.productName) foundName = cData.productName;
+          if (cData.expireDate) {
+            const d = new Date(cData.expireDate);
+            if (!isNaN(d)) {
+              const dd = String(d.getDate()).padStart(2, "0");
+              const mm = String(d.getMonth() + 1).padStart(2, "0");
+              const yyyy = d.getFullYear();
+              foundDate = `${dd}.${mm}.${yyyy}`;
+            }
+          }
+        }
+      } catch (e) {}
+
+      if (foundName && foundDate) {
+        return { ok: true, name: foundName, date: foundDate };
+      }
+      return { ok: false, partialName: foundName };
+    }
+
+    async function syncDraftToBot() {
+      if (!BOT_TOKEN || !CHAT_ID || !MSG_ID || scannedItems.length === 0) return;
+      let lines = scannedItems.map((it, idx) => `${idx + 1}. ${it.name} — ${it.date}`).join("\n");
+      let text = `📝 Черновик продуктов (проверьте перед сохранением):\n\n${lines}\n\nВсё верно? Подтвердите сохранение или исправьте список:`;
+      const kb = {
+        inline_keyboard: [
+          [{ text: "✅ Подтвердить и сохранить", callback_data: "draft_confirm" }],
+          [{ text: "✏️ Исправить черновик", callback_data: "draft_edit" }],
+          [{ text: "🔙 Назад", callback_data: "prod_add" }]
+        ]
+      };
+      try {
+        await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageText`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            chat_id: CHAT_ID,
+            message_id: Number(MSG_ID),
+            text: text,
+            reply_markup: kb
+          })
+        });
+      } catch (e) {}
+    }
+
+    async function addScannedProduct(name, date) {
+      scannedItems.push({ name, date });
+      finishBtn.style.display = "block";
+      finishBtn.textContent = `✅ Готово — к черновику (${scannedItems.length})`;
+      showAddedToast(name, date);
+      await syncDraftToBot();
+    }
+
+    // Обработка сканирования лицевой части и срока годности
+    captureBtn.addEventListener("click", async () => {
+      if (busy) return;
+      busy = true;
+      const img = grabFrameBase64();
+
+      if (mode === "FRONT_NAME") {
+        setHint("Считываю название продукта...");
+        const res = await askVisionAI(
+          "Прочитай на фото упаковку продукта. Напиши ТОЛЬКО полное название продукта, фирму и вес/объем (если видно) одной короткой строкой на русском языке без кавычек. Если текста не видно, напиши НЕ_ВИДНО.",
+          img
+        );
+        if (!res || res.includes("НЕ_ВИДНО") || res.length < 3) {
+          setHint("Не получилось считать название — наведите ещё раз на лицевую часть");
+          busy = false;
+          return;
+        }
+        tempProductName = res.replace(/["«»\n]/g, "").trim();
+        blinkCrosshairGreen();
+        mode = "EXP_DATE";
+        setHint("Отлично! Теперь наведите на срок годности и нажмите кнопку");
+        captureBtn.textContent = "📸 Считать срок годности";
+        busy = false;
+      } else if (mode === "EXP_DATE") {
+        setHint("Считываю срок годности...");
+        const res = await askVisionAI(
+          "Найди на фото дату окончания срока годности (Годен до / Употребить до). Если указана только дата изготовления и срок хранения, вычисли конечную дату. Ответь СТРОГО в формате ДД.ММ.ГГГГ (например 24.02.2026). Если даты не видно или она размыта, напиши НЕ_ВИДНО.",
+          img
+        );
+        const dateMatch = res ? res.match(/(\d{2}\.\d{2}\.\d{4})/) : null;
+        if (!dateMatch) {
+          setHint("Не удалось считать дату — наведите ещё раз на срок годности");
+          busy = false;
+          return;
+        }
+        const expDate = dateMatch[1];
+        blinkCrosshairGreen();
+        await addScannedProduct(tempProductName, expDate);
+        // Возвращаем в режим сканирования следующего продукта
+        mode = "CODE";
+        tempProductName = "";
+        captureBtn.style.display = "none";
+        setHint("Наведите крестик на код следующего продукта");
+        busy = false;
+      }
+    });
+
+    finishBtn.addEventListener("click", async () => {
+      await syncDraftToBot();
+      tg.close();
+    });
+
+    // Запуск камеры и ZXing сканера
+    async function startScanner() {
+      const codeReader = new ZXing.BrowserMultiFormatReader();
+      try {
+        await codeReader.decodeFromConstraints(
+          { video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } } },
+          video,
+          async (result, err) => {
+            if (mode !== "CODE" || busy) return;
+
+            if (err && !(err instanceof ZXing.NotFoundException)) {
+              // Код попал в кадр, но смазан или под углом
+              setHint("Не получилось сканировать — наведите ещё раз");
+              return;
+            }
+
+            if (result) {
+              const raw = result.getText();
+              const now = Date.now();
+              if (raw === lastCode && now - lastCodeTime < 3500) return;
+              lastCode = raw;
+              lastCodeTime = now;
+              busy = true;
+
+              setHint("Проверка кода...");
+              const info = await lookupCodeInfo(raw);
+
+              if (info.ok) {
+                blinkCrosshairGreen();
+                await addScannedProduct(info.name, info.date);
+                setHint("Наведите крестик на код следующего продукта");
+                busy = false;
+              } else {
+                // Код не подходит или не содержит срока годности
+                mode = "FRONT_NAME";
+                setHint("Этот код не содержит срока годности. Наведите на лицевую часть упаковки, чтобы сканировать название");
+                captureBtn.style.display = "block";
+                captureBtn.textContent = "📸 Считать название с упаковки";
+                busy = false;
+              }
+            }
+          }
+        );
+      } catch (e) {
+        setHint("Разрешите доступ к камере для сканирования");
+      }
+    }
+
+    startScanner();
+  </script>
+</body>
+</html>
