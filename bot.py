@@ -1249,7 +1249,7 @@ def render_diet_day(uid: int, day_idx: int):
     text += "━━━━━━━━━━━━━━━\n\n"
 
     kb = []
-        for m_idx, m in enumerate(meals):
+    for m_idx, m in enumerate(meals):
         m_num = m.get("num", m_idx + 1)
         m_title = m.get("title") or m.get("name") or "Прием пищи"
         m_weight = m.get("weight") or m.get("grams") or "—"
