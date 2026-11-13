@@ -1,104 +1,89 @@
-import asyncio
-import json
-import logging
-import math
 import os
 import re
+import io
+import math
+import json
+import base64
+import asyncio
 import sqlite3
+import logging
 from datetime import datetime, timedelta
-
 import pytz
 import requests
+from dotenv import load_dotenv
+
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart, StateFilter
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
+)
+from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import (
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    Message,
-)
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.fsm.storage.memory import MemoryStorage
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from dotenv import load_dotenv
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-
+BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "YOUR_OPENROUTER_API_KEY")
+SCANNER_WEBAPP_URL = os.getenv("SCANNER_WEBAPP_URL", "https://turbo-krot.github.io/Golubochkin-bot/scanner.html")
+DB_NAME = "nutrition_bot.db"
 MSK_TZ = pytz.timezone("Europe/Moscow")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 dp.include_router(router)
-
-DB_NAME = "nutrition_bot.db"
-
-WEEKDAYS_MAP = {
-    "понедельник": 0, "пн": 0,
-    "вторник": 1, "вт": 1,
-    "среда": 2, "ср": 2,
-    "четверг": 3, "чт": 3,
-    "пятница": 4, "пт": 4,
-    "суббота": 5, "сб": 5,
-    "воскресенье": 6, "вс": 6,
-}
-
+scheduler = AsyncIOScheduler(timezone=MSK_TZ)
 
 # ==========================================
-# 1. БАЗА ДАННЫХ (SQLite) С АВТО-ОБНОВЛЕНИЕМ
+# БАЗА ДАННЫХ (SQLite) С АВТО-МИГРАЦИЕЙ
 # ==========================================
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     c.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            mode TEXT DEFAULT 'both',
-            custom_bju TEXT,
-            height INTEGER,
-            weight REAL,
-            age INTEGER,
-            exp_level TEXT,
-            workouts TEXT,
-            goal TEXT,
-            has_supplements INTEGER DEFAULT 0,
-            supplements_json TEXT DEFAULT '{}',
-            allergies TEXT,
-            budget TEXT,
-            stores TEXT,
-            target_p INTEGER,
-            target_f INTEGER,
-            target_c INTEGER,
-            target_fiber INTEGER,
-            rec_meals INTEGER,
-            actual_meals INTEGER,
-            use_sport_nutr INTEGER DEFAULT 0,
-            notify_time TEXT DEFAULT '08:00',
-            current_diet_json TEXT,
-            next_diet_json TEXT,
-            recipes_cache_json TEXT DEFAULT '{}',
-            diet_start_date TEXT,
-            last_month_check TEXT,
-            tips_history_json TEXT DEFAULT '[]',
-            shopping_list_cache TEXT DEFAULT '',
-            offered_fridge INTEGER DEFAULT 0,
-            offered_diet INTEGER DEFAULT 0,
-            expert_note TEXT DEFAULT ''
-        )
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        mode TEXT,
+        custom_bju TEXT,
+        height INTEGER,
+        weight REAL,
+        age INTEGER,
+        exp_level TEXT,
+        workouts TEXT,
+        goal TEXT,
+        has_supplements INTEGER,
+        supplements_json TEXT,
+        allergies TEXT,
+        budget INTEGER,
+        stores TEXT,
+        target_p INTEGER,
+        target_f INTEGER,
+        target_c INTEGER,
+        target_fiber INTEGER,
+        rec_meals INTEGER,
+        actual_meals INTEGER,
+        use_sport_nutr INTEGER,
+        notify_time TEXT,
+        current_diet_json TEXT,
+        next_diet_json TEXT,
+        recipes_cache_json TEXT,
+        diet_start_date TEXT,
+        last_month_check TEXT,
+        tips_history_json TEXT DEFAULT '[]',
+        shopping_list_cache TEXT,
+        offered_fridge INTEGER DEFAULT 0,
+        offered_diet INTEGER DEFAULT 0,
+        expert_note TEXT
+    )
     """)
-    # Безопасное добавление новых колонок, если база уже была создана ранее
     new_cols = [
-        ("shopping_list_cache", "TEXT DEFAULT ''"),
+        ("shopping_list_cache", "TEXT"),
         ("offered_fridge", "INTEGER DEFAULT 0"),
         ("offered_diet", "INTEGER DEFAULT 0"),
-        ("expert_note", "TEXT DEFAULT ''"),
+        ("expert_note", "TEXT")
     ]
     for col_name, col_def in new_cols:
         try:
@@ -107,61 +92,59 @@ def init_db():
             pass
 
     c.execute("""
-        CREATE TABLE IF NOT EXISTS products (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            name TEXT,
-            exp_date TEXT,
-            added_at TEXT
-        )
+    CREATE TABLE IF NOT EXISTS products (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        name TEXT,
+        exp_date TEXT,
+        added_at TEXT
+    )
     """)
     conn.commit()
     conn.close()
 
-
-def get_user(user_id: int) -> dict:
+def get_user(user_id: int):
     conn = sqlite3.connect(DB_NAME)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
     row = c.fetchone()
+    if not row:
+        c.execute("INSERT INTO users (user_id) VALUES (?)", (user_id,))
+        conn.commit()
+        c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+        row = c.fetchone()
     conn.close()
-    return dict(row) if row else None
+    return dict(row)
 
-
-def save_user_field(user_id: int, **kwargs):
+def update_user(user_id: int, **kwargs):
+    if not kwargs:
+        return
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-    c.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
-    if not c.fetchone():
-        c.execute("INSERT INTO users (user_id) VALUES (?)", (user_id,))
-    for k, v in kwargs.items():
-        c.execute(f"UPDATE users SET {k} = ? WHERE user_id = ?", (v, user_id))
+    keys = ", ".join([f"{k} = ?" for k in kwargs.keys()])
+    vals = list(kwargs.values()) + [user_id]
+    c.execute(f"UPDATE users SET {keys} WHERE user_id = ?", vals)
     conn.commit()
     conn.close()
-
 
 def add_product_db(user_id: int, name: str, exp_date: str):
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     now_str = datetime.now(MSK_TZ).strftime("%d.%m.%Y")
-    c.execute(
-        "INSERT INTO products (user_id, name, exp_date, added_at) VALUES (?, ?, ?, ?)",
-        (user_id, name, exp_date, now_str),
-    )
+    c.execute("INSERT INTO products (user_id, name, exp_date, added_at) VALUES (?, ?, ?, ?)",
+              (user_id, name, exp_date, now_str))
     conn.commit()
     conn.close()
 
-
-def get_products_db(user_id: int) -> list:
+def get_products_db(user_id: int):
     conn = sqlite3.connect(DB_NAME)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     c.execute("SELECT * FROM products WHERE user_id = ? ORDER BY id ASC", (user_id,))
-    rows = c.fetchall()
+    rows = [dict(r) for r in c.fetchall()]
     conn.close()
-    return [dict(r) for r in rows]
-
+    return rows
 
 def delete_product_db(prod_id: int, user_id: int):
     conn = sqlite3.connect(DB_NAME)
@@ -170,1974 +153,1771 @@ def delete_product_db(prod_id: int, user_id: int):
     conn.commit()
     conn.close()
 
+# ==========================================
+# FSM СОСТОЯНИЯ
+# ==========================================
+class OnboardingSG(StatesGroup):
+    bju_choice = State()
+    manual_bju_input = State()
+    height = State()
+    weight = State()
+    age = State()
+    exp_level = State()
+    workouts = State()
+    goal = State()
+    high_weight_confirm = State()
+    has_supplements = State()
+    supplements_list = State()
+    supplement_freq = State()
+    allergies = State()
+    budget = State()
+    stores = State()
+    notify_time = State()
+    start_day_choice = State()
+    meals_ready_choice = State()
+    meals_count_input = State()
+    sport_nutr_choice = State()
+
+class DietReplaceSG(StatesGroup):
+    removing_dish = State()
+
+class ProductSG(StatesGroup):
+    waiting_product_input = State()
+    waiting_voice_input = State()
+    waiting_draft_edit = State()
+    waiting_bought_product = State()
 
 # ==========================================
-# 2. РАБОТА С НЕЙРОСЕТЬЮ (OpenRouter Free)
+# AI КЛИЕНТ (УМНЫЙ ДИЕТОЛОГ И ПОВАР)
 # ==========================================
-class OpenRouterClient:
-    def __init__(self):
-        self.free_models = [
-            "deepseek/deepseek-chat-v3-0324:free",
-            "deepseek/deepseek-chat:free",
-            "qwen/qwen-2.5-72b-instruct:free",
-            "google/gemini-2.0-flash-exp:free",
-            "meta-llama/llama-3.3-70b-instruct:free",
-        ]
+FREE_MODELS = [
+    "deepseek/deepseek-chat-v3-0324:free",
+    "deepseek/deepseek-chat:free",
+    "qwen/qwen-2.5-72b-instruct:free",
+    "google/gemini-2.0-flash-exp:free",
+    "meta-llama/llama-3.3-70b-instruct:free"
+]
 
-    def ask(self, system_prompt: str, user_prompt: str, temperature: float = 0.5) -> str:
-        url = "https://openrouter.ai/api/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://github.com/Golubochkin-bot",
-            "X-Title": "Golubochkin Nutrition Bot",
-        }
-        for model in self.free_models:
+def _sync_ai_call(prompt: str, system: str, temperature: float) -> str:
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    for model in FREE_MODELS:
+        try:
             payload = {
                 "model": model,
                 "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt}
                 ],
-                "temperature": temperature,
+                "temperature": temperature
             }
-            try:
-                resp = requests.post(url, headers=headers, json=payload, timeout=90)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if "choices" in data and len(data["choices"]) > 0:
-                        content = data["choices"][0]["message"].get("content", "")
-                        if content:
-                            return content
-                else:
-                    logging.warning(f"Модель {model} вернула код {resp.status_code}")
-            except Exception as e:
-                logging.error(f"Ошибка запроса к модели {model}: {e}")
-        return ""
+            r = requests.post(url, headers=headers, json=payload, timeout=75)
+            if r.status_code == 200:
+                data = r.json()
+                content = data["choices"][0]["message"]["content"]
+                if content:
+                    return content.strip()
+        except Exception as e:
+            logging.warning(f"Model {model} failed: {e}")
+            continue
+    return ""
 
+async def ask_ai(prompt: str, system: str = "Ты профессиональный спортивный нутрициолог, диетолог и шеф-повар.", temperature: float = 0.4) -> str:
+    return await asyncio.to_thread(_sync_ai_call, prompt, system, temperature)
 
-giga = OpenRouterClient()
-
+def clean_json_str(raw: str) -> str:
+    raw = re.sub(r"```json\s*", "", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"```\s*", "", raw)
+    start_brace = raw.find("{")
+    start_bracket = raw.find("[")
+    if start_brace != -1 and (start_bracket == -1 or start_brace < start_bracket):
+        end = raw.rfind("}")
+        if end != -1:
+            return raw[start_brace:end+1]
+    elif start_bracket != -1:
+        end = raw.rfind("]")
+        if end != -1:
+            return raw[start_bracket:end+1]
+    return raw.strip()
 
 # ==========================================
-# 3. ГОЛОВА БОТА: ЭКСПЕРТНЫЙ РАСЧЕТ БЖУ И ПРИЕМОВ ПИЩИ
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДАТ И НАВИГАЦИИ
 # ==========================================
-def get_diet_dates_list(start_date_str: str) -> list[str]:
-    """Возвращает 7 дат в формате ДД.ММ начиная с даты старта рациона."""
+def get_msk_now() -> datetime:
+    return datetime.now(MSK_TZ)
+
+def get_diet_dates_list(start_date_str: str) -> list:
     try:
-        start_dt = datetime.strptime(start_date_str, "%d.%m.%Y").date()
+        start_dt = datetime.strptime(start_date_str, "%Y-%m-%d")
     except Exception:
-        start_dt = datetime.now(MSK_TZ).date() + timedelta(days=1)
+        start_dt = get_msk_now() + timedelta(days=1)
     return [(start_dt + timedelta(days=i)).strftime("%d.%m") for i in range(7)]
 
-
-def calculate_macros(user: dict) -> dict:
-    """
-    Умный экспертный расчет БЖУ с участием нейросети ('головы бота') и проверкой безопасности:
-    - Норма белка в среднем 1.5 - 2.0 г на 1 кг веса (никогда не 2.5 - 3 г!).
-    - При маленьком весе (<55 кг) не нагружаем сразу большим количеством еды, усвоение ~25 г белка за прием.
-    - При весе > 90-95 кг и цели 'Набор мышечной массы' — предупреждаем пользователя, что набирать массу при таком весе не рекомендуется, лучше выбрать сушку/рекомпозицию (но выбор за ним).
-    - Питание максимум 5 раз в день (6 раз не предлагаем).
-    - Если по расчетам выходит, например, 157 г белка — не делаем 6-й прием ради 7 г, а урезаем до 150 г (на 5 приемов).
-    - Если белка 165-170 г и выше — объясняем, что есть 5-6 раз тяжело, большинство едят 3-4 раза и добавляют протеин или гейнер.
-    """
-    weight = float(user.get("weight") or 75)
-    height = int(user.get("height") or 175)
-    age = int(user.get("age") or 25)
-    goal = user.get("goal") or "Набор мышечной массы"
-    exp = user.get("exp_level") or "Начинающий"
-    workouts = user.get("workouts") or "1-3"
-
-    # Если пользователь ввел свои дневные показатели БЖУ вручную
-    if user.get("custom_bju"):
-        try:
-            parts = [int(x) for x in re.findall(r"\d+", user["custom_bju"])]
-            if len(parts) >= 3:
-                p, f, c = parts[0], parts[1], parts[2]
-                fiber = parts[3] if len(parts) >= 4 else 30
-                rec_meals = min(5, max(3, round(p / 30.0)))
-                return {
-                    "p": p, "f": f, "c": c, "fiber": fiber,
-                    "rec_meals": rec_meals,
-                    "expert_note": "Рассчитано по вашим индивидуальным дневным показателям БЖУ.",
-                    "high_protein_sport_hint": p >= 165,
-                    "heavy_mass_warning": (weight >= 90 and "набор" in goal.lower()),
-                }
-        except Exception:
-            pass
-
-    # Запрос к нейросети ("голове бота") для точной экспертной оценки
-    sys_p = (
-        "Ты — профессиональный спортивный нутрициолог и фитнес-тренер. "
-        "Рассчитай дневную норму БЖУ на основе проверенных научных источников строго в формате JSON."
-    )
-    usr_p = f"""
-Данные человека: Рост {height} см, Вес {weight} кг, Возраст {age} лет, Опыт: {exp}, Тренировок в неделю: {workouts}, Цель: {goal}.
-Правила:
-1. Белок должен быть в разумных пределах 1.5 - 2.0 г на кг веса (при большом весе >90 кг считай на сухую/оптимальную массу тела, никогда не ставь 2.5-3 г/кг).
-2. При маленьком весе (<55 кг) не давай сразу огромный профицит (это опасно для ЖКТ, нужно набирать постепенно, за 1 прием усваивается ~25 г белка).
-3. Если белка получилось например 155-158 г, округли до 150 г (чтобы ровно ложилось в 5 приемов пищи по 30 г без лишнего 6-го приема).
-4. Рекомендуемое количество приемов пищи (rec_meals): от 3 до 5 (максимум 5!).
-Верни СТРОГО JSON:
-{{"p": 140, "f": 60, "c": 260, "fiber": 30, "rec_meals": 4, "expert_note": "Краткий совет эксперта (1-2 предложения)"}}
-"""
-    raw = giga.ask(sys_p, usr_p, temperature=0.3)
-    ai_p, ai_f, ai_c, ai_fiber, ai_meals, expert_note = None, None, None, 30, None, ""
+async def safe_edit(message: Message, text: str, reply_markup: InlineKeyboardMarkup = None):
     try:
-        m = re.search(r"\{.*\}", raw, re.DOTALL)
-        if m:
-            d = json.loads(m.group(0))
-            ai_p = int(d.get("p", 0))
-            ai_f = int(d.get("f", 0))
-            ai_c = int(d.get("c", 0))
-            ai_fiber = int(d.get("fiber", 30))
-            ai_meals = int(d.get("rec_meals", 4))
-            expert_note = d.get("expert_note", "")
+        await message.edit_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+    except Exception:
+        try:
+            await message.edit_text(text, reply_markup=reply_markup)
+        except Exception:
+            await message.answer(text, reply_markup=reply_markup)
+
+async def try_delete_user_msg(message: Message):
+    try:
+        await message.delete()
     except Exception:
         pass
 
-    # Надежная проверка и корректировка по твоим правилам
-    effective_weight = min(weight, 88.0) if weight > 90 else weight
-    if not ai_p or ai_p < 60 or ai_p > 210:
-        if weight < 55:
-            p_mult = 1.6  # Плавный безопасный старт для небольшого веса
-        elif "набор" in goal.lower():
-            p_mult = 1.8 if exp == "Начинающий" else 2.0
-        else:
-            p_mult = 1.8
-        ai_p = int(round(effective_weight * p_mult))
+def back_kb(cb_data: str = "onboard_back") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад", callback_data=cb_data)]
+    ])
 
-    if not ai_c or ai_c < 80 or ai_c > 450:
-        if "набор" in goal.lower():
-            c_mult = 3.2 if weight < 55 else (2.5 if weight >= 90 else 3.6)
-        else:
-            c_mult = 2.0
-        ai_c = int(round(effective_weight * c_mult))
+async def push_step(state: FSMContext, step_name: str):
+    data = await state.get_data()
+    history = data.get("history", [])
+    if not history or history[-1] != step_name:
+        history.append(step_name)
+    await state.update_data(history=history)
 
-    if not ai_f or ai_f < 25 or ai_f > 130:
-        f_mult = 0.9 if "набор" in goal.lower() else 0.8
-        ai_f = max(30, int(round(effective_weight * f_mult)))
+# ==========================================
+# УМНЫЙ РАСЧЕТ БЖУ И ПРИЕМОВ ПИЩИ (ГОЛОВА БОТА)
+# ==========================================
+async def calculate_smart_bju_and_meals(u: dict) -> dict:
+    w = float(u["weight"] or 70)
+    h = int(u["height"] or 175)
+    age = int(u["age"] or 25)
+    goal = u["goal"] or "Набор мышечной массы"
+    exp = u["exp_level"] or "Начинающий"
+    workouts = u["workouts"] or "1-3"
 
-    # Правило: если получилось 151..162 г белка (5 приемов + 1..12 г хвостика), урезаем до 150 г, чтобы не делать 6-й прием!
-    if 151 <= ai_p <= 162:
-        ai_p = 150
+    if u["custom_bju"]:
+        p, f, c = map(int, u["custom_bju"].split())
+        fiber = 30
+        expert_note = "Использованы ваши индивидуальные дневные показатели БЖУ."
+    else:
+        prompt = f"""Рассчитай дневную норму БЖУ и клетчатки для человека:
+Рост: {h} см, Вес: {w} кг, Возраст: {age} лет, Опыт: {exp}, Тренировок в неделю: {workouts}, Цель: {goal}.
 
-    per_meal_p = 25.0 if weight < 55 else 30.0
-    calc_meals = math.ceil(ai_p / per_meal_p)
-    # Если из-за 5-8 грамм перевалило на следующий прием пищи — урезаем эти граммы!
-    if calc_meals > 3 and (ai_p - (calc_meals - 1) * per_meal_p) <= 8:
-        calc_meals -= 1
-        ai_p = int(calc_meals * per_meal_p)
+СТРОГИЕ ПРАВИЛА БЕЗОПАСНОЙ И ПРОВЕРЕННОЙ НУТРИЦИОЛОГИИ:
+1. Никаких заоблачных цифр! Средняя норма белка — от 1.5 до 2.0 г на 1 кг веса. Никогда не ставь 2.5-3 г на кг.
+2. Если вес человека маленький (например, меньше 55 кг), организм должен привыкать постепенно: белок рассчитывай так, чтобы за один прием пищи выходило около 25 г белка (не перегружай ЖКТ с первого дня).
+3. Жиры: около 0.8 - 1.1 г на кг веса.
+4. Углеводы: сбалансированно под цель ({goal}) и активность ({workouts}).
 
-    rec_meals = min(5, max(3, calc_meals))
+Верни СТРОГО JSON без лишнего текста:
+{{"p": число_белков, "f": число_жиров, "c": число_углеводов, "fiber": число_клетчатки, "note": "краткое пояснение диетолога в 1 предложение"}}"""
+        res = await ask_ai(prompt, system="Отвечай строго в формате JSON.", temperature=0.2)
+        try:
+            d = json.loads(clean_json_str(res))
+            p = int(d.get("p", round(w * 1.7)))
+            f = int(d.get("f", round(w * 0.9)))
+            c = int(d.get("c", round(w * 3.2)))
+            fiber = int(d.get("fiber", 30))
+            expert_note = d.get("note", "Сбалансированный расчет по проверенным нормам (1.5–2 г белка на кг).")
+        except Exception:
+            if w < 55:
+                p = round(w * 1.6)
+            else:
+                p = round(w * (1.8 if goal == "Сушка" else 1.7))
+            f = round(w * 0.9)
+            c = round(w * (2.2 if goal == "Сушка" else 3.5))
+            fiber = 30
+            expert_note = "Сбалансированный расчет по проверенным нормам (1.5–2 г белка на кг)."
 
-    heavy_mass_warning = (weight >= 90 and "набор" in goal.lower())
-    high_protein_sport_hint = (ai_p >= 165)
+    # Умное округление и распределение по приемам пищи (максимум 5 приемов, никогда не 6!)
+    per_meal_p = 25 if w < 55 else 32
+    raw_meals = p / per_meal_p
+
+    if raw_meals <= 3.3:
+        rec_meals = 3
+    elif raw_meals <= 4.3:
+        rec_meals = 4
+    else:
+        rec_meals = 5
+
+    # Если при делении на 5 остается маленький "хвостик" (например 157г -> 7г лишних),
+    # не делаем 6-й прием и не пихаем остаток, а аккуратно округляем до 150-160г:
+    if rec_meals == 5 and 150 < p < 165 and not u["custom_bju"]:
+        p = 150
 
     return {
-        "p": ai_p,
-        "f": ai_f,
-        "c": ai_c,
-        "fiber": ai_fiber,
+        "p": p,
+        "f": f,
+        "c": c,
+        "fiber": fiber,
         "rec_meals": rec_meals,
-        "expert_note": expert_note,
-        "high_protein_sport_hint": high_protein_sport_hint,
-        "heavy_mass_warning": heavy_mass_warning,
+        "note": expert_note
     }
 
-
-def generate_weekly_diet_ai(user: dict, is_next_week: bool = False, exclude_dish: str = None) -> dict:
-    """Генерирует практичный, реальный рацион из простых продуктов магазинов пользователя с датами ДД.ММ."""
-    meals_count = int(user.get("actual_meals") or user.get("rec_meals") or 4)
-    use_sport = bool(user.get("use_sport_nutr"))
-    target_p = int(user.get("target_p") or 140)
-    target_f = int(user.get("target_f") or 60)
-    target_c = int(user.get("target_c") or 260)
-    weight = float(user.get("weight") or 75)
-    max_p_per_meal = 25 if weight < 55 else 30
-
-    if not use_sport:
-        actual_daily_p = min(target_p, meals_count * max_p_per_meal)
-        actual_daily_c = min(target_c, meals_count * 65)
-    else:
-        actual_daily_p = target_p
-        actual_daily_c = target_c
-
-    actual_daily_f = target_f
-
-    start_date_str = user.get("diet_start_date") or (datetime.now(MSK_TZ).date() + timedelta(days=1)).strftime("%d.%m.%Y")
-    if is_next_week:
-        try:
-            dt = datetime.strptime(start_date_str, "%d.%m.%Y").date() + timedelta(days=7)
-            start_date_str = dt.strftime("%d.%m.%Y")
-        except Exception:
-            pass
+# ==========================================
+# ГЕНЕРАЦИЯ РАЦИОНА И СПИСКА ПОКУПОК ЧЕРЕЗ ИИ
+# ==========================================
+async def generate_weekly_diet_json(u: dict, start_date_str: str, forbidden_dish: str = None) -> dict:
     dates_list = get_diet_dates_list(start_date_str)
+    supps_info = "Нет"
+    if u["has_supplements"] and u["supplements_json"]:
+        supps = json.loads(u["supplements_json"])
+        supps_info = ", ".join([f"{s['name']} ({s.get('freq', 'по инструкции')})" for s in supps])
 
-    products = get_products_db(user["user_id"])
-    fridge_items = ", ".join([p["name"] for p in products]) if products else "нет данных"
-    supps_data = json.loads(user.get("supplements_json") or "{}")
-    supps_text = "; ".join([f"{k} ({v})" for k, v in supps_data.items()]) if supps_data else "Протеин / Гейнер по норме"
-
-    system_prompt = (
-        "Ты — практичный российский спортивный нутрициолог. "
-        "Составляй рацион ТОЛЬКО из простых, доступных продуктов, которые реально продаются в магазинах пользователя и легко готовятся."
+    sport_nutr_rule = (
+        "Пользователь использует спортивное питание / добавки. Обязательно впиши их в приемы пищи. "
+        "ВАЖНОЕ ПРАВИЛО: протеин усваивается с углеводами, поэтому НИКОГДА не ставь пустой протеин отдельно — всегда комбинируй его с углеводами (например: банан, овсянка, тост, хлебцы или каша)."
+        if u["use_sport_nutr"] else
+        "Без спортивного питания — только обычная доступная еда."
     )
+    forbid_rule = f"СТРОГО ИСКЛЮЧИ блюдо/продукт: {forbidden_dish}!" if forbidden_dish else ""
 
-    sport_rule = (
-        f"Пользователь выбрал рацион СО СПОРТИВНЫМ ПИТАНИЕМ ({supps_text}). "
-        "Впиши спортивное питание между приемами пищи или вместе с ними, чтобы добрать целевое БЖУ. "
-        "ВАЖНО: Белок без углеводов и углеводы без белка НЕ употребляются! Если ставишь протеин — обязательно добавь к нему углевод (например, банан, хлебцы, овсянку)."
-        if use_sport
-        else f"Рацион БЕЗ спортивного питания. За один прием пищи максимум {max_p_per_meal} г белка и 65 г углеводов."
-    )
+    prompt = f"""Составь практичный, вкусный и простой план питания на 7 дней по датам: {", ".join(dates_list)}.
+Параметры пользователя:
+- Пол/возраст/вес/рост: {u['age']} лет, {u['weight']} кг, {u['height']} см
+- Опыт и тренировки: {u['exp_level']}, тренировок в неделю: {u['workouts']}
+- Цель: {u['goal']}
+- Целевое дневное БЖУ: Белки {u['target_p']}г, Жиры {u['target_f']}г, Углеводы {u['target_c']}г, Клетчатка {u['target_fiber']}г
+- Количество приемов пищи в день: СТРОГО {u['actual_meals']} (за 1 прием пищи усваивается в среднем 25-35г белка и до 75г углеводов)
+- Бюджет на неделю: {u['budget']} руб.
+- Магазины: {u['stores']}
+- Аллергии и противопоказания: {u['allergies']}
+- Добавки пользователя: {supps_info}
+- {sport_nutr_rule}
+{forbid_rule}
 
-    exclude_rule = f"Исключи блюдо/продукт '{exclude_dish}'!" if exclude_dish else ""
+ВАЖНЕЙШИЕ ТРЕБОВАНИЯ К ПРОСТОТЕ И ПРАКТИЧНОСТИ БЛЮД:
+1. Никаких ресторанных изысков! ЗАПРЕЩЕНЫ: утка, форель, говядина Блэк Ангус, трюфельное масло, моллюски, дорогие стейки, артишоки и редкие ингредиенты.
+2. Используй простые, базовые и понятные продукты из магазинов ({u['stores']}): куриная грудка/бедро, индейка, обычная постная говядина, яйца, творог, горбуша/минтай/треска, гречка, рис, овсянка, макароны из тв. сортов, картофель, сезонные овощи и фрукты.
+3. Практичность: блюда могут разумно повторяться на 2 дня (чтобы человек не стоял у плиты по 5 раз каждый день с нуля), но рацион на неделю должен быть разнообразным и вкусным.
+4. Все граммовки указывай точно (в граммах сухого/сырого или готового продукта).
 
-    user_prompt = f"""
-Составь практичный рацион на 7 дней по датам: {', '.join(dates_list)}.
-Данные пользователя:
-- Вес: {user['weight']} кг, Рост: {user['height']} см, Цель: {user['goal']}
-- Аллергии/противопоказания: {user['allergies']}
-- Бюджет на неделю: {user['budget']}
-- Магазины пользователя: {user['stores']}
-- Продукты, которые УЖЕ есть дома (используй в первую очередь): {fridge_items}
-- Приемов пищи в день: {meals_count}
-- Целевое БЖУ в день: Белки {actual_daily_p} г, Жиры {actual_daily_f} г, Углеводы {actual_daily_c} г.
-- {sport_rule}
-- {exclude_rule}
-
-ЖЕСТКИЕ ПРАВИЛА ПО ПРОДУКТАМ И БЛЮДАМ:
-1. Никаких сложных ресторанных блюд, трюфелей, моллюсков, утки, мраморной говядины Black Angus или дорогой форели!
-2. Используй простые народные продукты: куриная грудка/филе бедра, индейка, обычная нежирная говядина/вырезка, горбуша или минтай/треска, яйца, творог, кефир, сыр, гречка, рис, овсянка, макароны, картофель, простые овощи и фрукты (огурцы, помидоры, капуста, яблоки, бананы).
-3. Блюда МОГУТ и должны практично повторяться (например, на 2 дня подряд), чтобы человеку было удобно готовить и закупаться в магазине {user['stores']}.
-
-Верни СТРОГО валидный JSON следующей структуры:
+Верни ответ СТРОГО в формате валидного JSON такой структуры:
 {{
-  "weekly_summary": {{
-    "daily_p": {actual_daily_p},
-    "daily_f": {actual_daily_f},
-    "daily_c": {actual_daily_c},
-    "week_p": {actual_daily_p * 7},
-    "week_f": {actual_daily_f * 7},
-    "week_c": {actual_daily_c * 7},
-    "note": "Краткий совет по рациону"
-  }},
   "days": [
     {{
-      "day_num": 1,
-      "day_name": "{dates_list[0]}",
-      "p": {actual_daily_p},
-      "f": {actual_daily_f},
-      "c": {actual_daily_c},
+      "date": "{dates_list[0]}",
       "meals": [
         {{
-          "meal_num": 1,
-          "meal_title": "Прием 1",
-          "dish_name": "Овсяная каша с вареными яйцами",
-          "ingredients": "Овсяные хлопья 60г, яйца куриные 2 шт, молоко 100мл",
-          "p": 24,
-          "f": 14,
-          "c": 45
+          "num": 1,
+          "title": "Понятное название блюда и состав с граммовками (например: Овсянка 70г на молоке + 3 вареных яйца)",
+          "weight": "350 г",
+          "p": 30,
+          "f": 15,
+          "c": 55,
+          "short_ingredients": "Овсяные хлопья 70г, молоко 150мл, яйца куриные 3 шт"
         }}
       ]
     }}
   ]
 }}
-Обязательно создай все 7 дней (day_num от 1 до 7) с датами {', '.join(dates_list)}.
-"""
+В массиве "days" должно быть ровно 7 элементов с датами: {", ".join(dates_list)}. В каждом дне ровно {u['actual_meals']} приемов пищи."""
 
-    raw = giga.ask(system_prompt, user_prompt, temperature=0.4)
+    res = await ask_ai(prompt, system="Отвечай строго валидным JSON без комментариев.", temperature=0.3)
+    res = clean_json_str(res)
     try:
-        match = re.search(r"\{.*\}", raw, re.DOTALL)
-        if match:
-            data = json.loads(match.group(0))
-            if "days" in data and len(data["days"]) == 7:
-                for idx, d in enumerate(data["days"]):
-                    d["day_num"] = idx + 1
-                    d["day_name"] = dates_list[idx]
-                return data
+        data = json.loads(res)
+        # Жестко проставляем реальные числа ДД.ММ по реальному времени
+        for i, d_item in enumerate(data.get("days", [])):
+            if i < len(dates_list):
+                d_item["date"] = dates_list[i]
+        return data
     except Exception as e:
-        logging.error(f"JSON diet parse error: {e}")
+        logging.error(f"Diet JSON parse error: {e} | Raw: {res}")
+        return None
 
-    return build_fallback_diet(meals_count, actual_daily_p, actual_daily_f, actual_daily_c, use_sport, supps_text, dates_list)
+async def generate_shopping_list_ai(u: dict, diet_data: dict) -> str:
+    prompt = f"""На основе этого 7-дневного рациона составь точный список покупок на неделю:
+Рацион: {json.dumps(diet_data, ensure_ascii=False)}
 
+Магазины пользователя: {u['stores']}
+Недельный бюджет пользователя: {u['budget']} руб.
 
-def build_fallback_diet(meals_count, daily_p, daily_f, daily_c, use_sport, supps_text, dates_list):
-    sample_dishes = [
-        ("Овсянка на молоке + 2 вареных яйца", "Овсяные хлопья 60г, яйца куриные 2 шт, молоко 100мл"),
-        ("Куриное филе с гречкой и огурцом", "Филе куриной грудки 130г, гречка 60г, огурец свежий 100г"),
-        ("Индейка тушеная с рисом", "Филе индейки 130г, рис 60г, морковь и лук 50г"),
-        ("Творог 5% с бананом и хлебцами", "Творог 5% 150г, банан 1 шт, хлебцы 2 шт"),
-        ("Горбуша запеченная с картофелем", "Филе горбуши 140г, картофель 160г, капустный салат 100г"),
-        ("Говяжья вырезка тушеная с макаронами", "Говядина постная 120г, макароны из тв. сортов 60г, томаты 100г"),
-        ("Омлет из 3 яиц с хлебом и сыром", "Яйца куриные 3 шт, хлеб цельнозерновой 2 ломтика, сыр 20г"),
-    ]
-    p_per_meal = min(30, int(daily_p / meals_count))
-    f_per_meal = int(daily_f / meals_count)
-    c_per_meal = min(65, int(daily_c / meals_count))
-
-    days = []
-    for d_idx, date_label in enumerate(dates_list, start=1):
-        meals = []
-        for m_idx in range(1, meals_count + 1):
-            dish, ingr = sample_dishes[(d_idx + m_idx) % len(sample_dishes)]
-            meals.append({
-                "meal_num": m_idx,
-                "meal_title": f"Прием {m_idx}",
-                "dish_name": dish,
-                "ingredients": ingr,
-                "p": p_per_meal,
-                "f": f_per_meal,
-                "c": c_per_meal,
-            })
-        if use_sport:
-            meals.append({
-                "meal_num": meals_count + 1,
-                "meal_title": "Спортивное питание",
-                "dish_name": "Протеин + Банан (белок + углеводы)",
-                "ingredients": f"Протеин 1 порция (30г), банан 1 шт (120г). Добавки: {supps_text}",
-                "p": max(20, daily_p - p_per_meal * meals_count),
-                "f": 2,
-                "c": max(25, daily_c - c_per_meal * meals_count),
-            })
-        days.append({
-            "day_num": d_idx,
-            "day_name": date_label,
-            "p": daily_p,
-            "f": daily_f,
-            "c": daily_c,
-            "meals": meals,
-        })
-
-    return {
-        "weekly_summary": {
-            "daily_p": daily_p,
-            "daily_f": daily_f,
-            "daily_c": daily_c,
-            "week_p": daily_p * 7,
-            "week_f": daily_f * 7,
-            "week_c": daily_c * 7,
-            "note": "Практичный рацион из простых и доступных продуктов.",
-        },
-        "days": days,
-    }
-
-
-def generate_shopping_list_ai(user: dict, diet_data: dict) -> str:
-    """Формирует список покупок под магазины пользователя со средними ценами, марками хорошего качества и итоговой суммой."""
-    cached = user.get("shopping_list_cache")
-    if cached and len(cached) > 20:
-        return cached
-
-    all_ingredients = []
-    for d in diet_data.get("days", []):
-        for m in d.get("meals", []):
-            all_ingredients.append(f"{m['dish_name']} ({m['ingredients']})")
-
-    fridge_prods = get_products_db(user["user_id"])
-    already_have = ", ".join([p["name"] for p in fridge_prods]) if fridge_prods else "нет"
-
-    sys_p = (
-        "Ты — эксперт по закупкам продуктов в российских торговых сетях. "
-        "Твоя задача — составить точный список покупок на неделю по рациону пользователя."
-    )
-    usr_p = f"""
-Магазины пользователя: {user['stores']}
-Бюджет пользователя на неделю: {user['budget']}
-Продукты, которые уже есть дома: {already_have}
-Все приемы пищи за неделю: {'; '.join(all_ingredients[:25])}
-
-Правила составления списка покупок:
-1. Опирайся ИСКЛЮЧИТЕЛЬНО на магазины, которые указал пользователь ({user['stores']}).
-2. Выбирай продукты хорошего качества в среднем ценовом сегменте (НЕ самые дорогие премиум-бренды, но и НЕ самые дешевые низкокачественные аналоги).
-3. Укажи конкретный продукт, популярную проверенную фирму/марку (которая реально продается в {user['stores']}), нужное количество/вес на всю неделю и актуальную среднюю стоимость в рублях согласно этому весу.
-4. В самом низу обязательно напиши ИТОГОВУЮ СТОИМОСТЬ всех продуктов в рублях.
-5. Оформи красиво, презентабельно, по категориям (Мясо/Птица/Рыба, Молочные продукты и яйца, Крупы и бакалея, Овощи и фрукты), используя HTML-теги <b> и списки •.
-"""
-    res = giga.ask(sys_p, usr_p, temperature=0.4)
-    if not res:
-        res = (
-            f"🛒 <b>Список продуктов на неделю (Магазины: {user['stores']})</b>\n\n"
-            "<b>🥩 Мясо, птица и рыба:</b>\n"
-            "• Филе грудки куриной (Петелинка / Благояр) — 1.2 кг (~480 ₽)\n"
-            "• Филе индейки (Индилайт) — 800 г (~460 ₽)\n"
-            "• Горбуша свежемороженая / филе — 700 г (~350 ₽)\n\n"
-            "<b>🥛 Молочные продукты и яйца:</b>\n"
-            "• Яйцо куриное С1 (Окское / Роскар) — 2 десятка (~240 ₽)\n"
-            "• Творог 5% (Простоквашино / Савушкин) — 4 пачки по 180г (~360 ₽)\n"
-            "• Молоко 2.5% (Домик в деревне / Простоквашино) — 1 л (~95 ₽)\n\n"
-            "<b>🌾 Крупы и бакалея:</b>\n"
-            "• Овсяные хлопья Геркулес (Русский продукт / Ясно Солнышко) — 500 г (~65 ₽)\n"
-            "• Гречневая крупа ядрица (Увелка / Мистраль) — 800 г (~110 ₽)\n"
-            "• Рис длиннозерный / бурый (Националь) — 800 г (~140 ₽)\n"
-            "• Макароны из тв. сортов (Barilla / Makfa) — 450 г (~95 ₽)\n"
-            "• Хлебцы цельнозерновые (Dr.Korner) — 2 уп. (~160 ₽)\n\n"
-            "<b>🥦 Овощи и фрукты:</b>\n"
-            "• Бананы — 1.2 кг (~180 ₽)\n"
-            "• Огурцы и томаты свежие — 1.5 кг (~350 ₽)\n"
-            "• Картофель и капуста белокочанная — 1.5 кг (~120 ₽)\n\n"
-            "💰 <b>Итоговая стоимость всех продуктов: ~3 205 ₽</b>"
-        )
-    save_user_field(user["user_id"], shopping_list_cache=res)
-    return res
-
-
-def get_detailed_recipe(user_id: int, dish_name: str, ingredients: str) -> str:
-    user = get_user(user_id)
-    cache = json.loads(user.get("recipes_cache_json") or "{}")
-    if dish_name in cache:
-        return cache[dish_name]
-
-    sys_p = "Ты — опытный шеф-повар. Напиши простой и понятный пошаговый рецепт приготовления блюда (вплоть до того, сколько минут варить яйцо или крупу)."
-    usr_p = f"Блюдо: {dish_name}\nИнгредиенты: {ingredients}\nНапиши подробный пошаговый рецепт."
-    recipe = giga.ask(sys_p, usr_p, temperature=0.4)
-    if not recipe:
-        recipe = (
-            f"<b>📖 Подробный рецепт: {dish_name}</b>\n\n"
-            f"<b>Ингредиенты:</b> {ingredients}\n\n"
-            "1. Подготовьте и взвесьте все ингредиенты.\n"
-            "2. Если в блюде есть яйца: положите в холодную воду, после закипания варите 8–9 минут вкрутую, затем остудите в холодной воде.\n"
-            "3. Крупу промойте и варите на медленном огне в пропорции 1:2 с водой 15–20 минут.\n"
-            "4. Птицу/рыбу/мясо потушите на сковороде с каплей воды или запеките в духовке при 180°C в течение 20–25 минут."
-        )
-    cache[dish_name] = recipe
-    save_user_field(user_id, recipes_cache_json=json.dumps(cache, ensure_ascii=False))
-    return recipe
-
+ПРАВИЛА СОСТАВЛЕНИЯ КОРЗИНЫ:
+1. Подбери конкретные продукты (среднего хорошего качества, доступные марки из указанных магазинов: {u['stores']}).
+2. Посчитай общий нужный вес/количество каждого продукта на всю неделю (например: Филе куриной грудки — 2.2 кг, Гречневая крупа — 1 пачка 900г, Яйца С1 — 2 десятка и т.д.).
+3. Укажи примерную актуальную цену за каждую позицию в рублях и в самом конце напиши **ИТОГО: ~ХХХХ руб.** (постарайся уложиться в бюджет {u['budget']} руб.).
+4. Оформи список чисто, аккуратно, по категориям (Мясо/Птица/Рыба, Крупы и гарниры, Молочное и яйца, Овощи и фрукты, Бакалея)."""
+    return await ask_ai(prompt, temperature=0.3)
 
 # ==========================================
-# 4. СОСТОЯНИЯ (FSM)
+# /START И ГЛАВНОЕ МЕНЮ РЕЖИМОВ
 # ==========================================
-class OnboardingSG(StatesGroup):
-    ask_custom_bju_choice = State()
-    entering_custom_bju = State()
-    q1_height = State()
-    q2_weight = State()
-    q3_age = State()
-    q4_exp = State()
-    q5_workouts_btn = State()
-    q5_workouts_pro_text = State()
-    q6_goal = State()
-    q7_supps_choice = State()
-    q8_supps_list = State()
-    q9_supps_freq = State()
-    q10_allergies = State()
-    q_budget = State()
-    q_stores = State()
-    q_notify_time = State()
-    q_start_day = State()
-    q_ready_meals = State()
-    q_custom_meals_count = State()
-    q_sport_nutr_mode = State()
+def main_modes_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🥗 Рацион", callback_data="mode_diet")],
+        [InlineKeyboardButton(text="📦 Продуктовый контроль", callback_data="mode_products")]
+    ])
 
-
-class EditProfileSG(StatesGroup):
-    edit_weight = State()
-    edit_meals = State()
-    edit_budget = State()
-    add_supp_name = State()
-    add_supp_freq = State()
-    exclude_dish_name = State()
-    insert_bought_product = State()
-
-
-class FridgeSG(StatesGroup):
-    entering_product = State()
-    confirm_more = State()
-
-
-# ==========================================
-# 5. КЛАВИАТУРЫ И НАВИГАЦИЯ «НАЗАД»
-# ==========================================
-def kb_start_modes() -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.button(text="🥗 Рацион", callback_data="mode_diet")
-    b.button(text="📦 Продуктовый контроль", callback_data="mode_fridge")
-    b.adjust(2)
-    return b.as_markup()
-
-
-def kb_back_only(cb_data: str = "onboard_back") -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.button(text="🔙 Назад", callback_data=cb_data)
-    return b.as_markup()
-
-
-def kb_main_app_menu(user: dict, diet_data: dict) -> InlineKeyboardMarkup:
-    """
-    Компактная, презентабельная клавиатура приложения Рациона:
-    - Кнопки дней: ТОЛЬКО ЧИСЛА (например 16.12, 17.12) без значка календаря!
-    - Кнопка списка покупок.
-    - Кнопка добавления купленного продукта в рацион.
-    - ОДНА кнопка перехода в Контроль продуктов (чтобы не засорять экран).
-    """
-    b = InlineKeyboardBuilder()
-    days = diet_data.get("days", [])
-    for d in days:
-        d_num = d.get("day_num", 1)
-        d_label = d.get("day_name", f"День {d_num}")
-        b.button(text=f"{d_label}", callback_data=f"view_day_{d_num}_curr")
-
-    b.button(text="🛒 Список продуктов к покупке", callback_data="view_shopping_list")
-    b.button(text="🥑 Вписать купленный продукт", callback_data="insert_bought_prod")
-
-    if user.get("next_diet_json"):
-        b.button(text="⏭ Показать след. неделю", callback_data="view_next_week")
-    else:
-        b.button(text="⏭ Рацион на след. неделю", callback_data="gen_next_week")
-
-    b.button(text="🔄 Изменить рацион / блюдо", callback_data="open_diet_edit_menu")
-    b.button(text="⚙️ Изменить мои данные", callback_data="open_profile_edit_menu")
-    b.button(text="📦 Контроль продуктов", callback_data="open_fridge_app")
-
-    # 4 + 3 для дат (чтобы на любом экране телефона числа были крупными и читаемыми), далее по 1-2 кнопки
-    b.adjust(4, 3, 1, 2, 2, 1)
-    return b.as_markup()
-
-
-async def push_step(state: FSMContext, step_name: str):
-    data = await state.get_data()
-    history = data.get("step_history", [])
-    if not history or history[-1] != step_name:
-        history.append(step_name)
-    await state.update_data(step_history=history)
-
-
-async def render_onboarding_step(target_message: Message, state: FSMContext, step_name: str, user_id: int, is_edit: bool = True):
-    """Отрисовывает любой шаг анкеты (при движении вперед или при нажатии кнопки 'Назад' сколько угодно раз)."""
-    send_fn = target_message.edit_text if is_edit else target_message.answer
-
-    if step_name == "start_modes":
-        await state.clear()
-        await send_fn("Выберите режим:", reply_markup=kb_start_modes())
-        return
-
-    if step_name == "ask_custom_bju_choice":
-        save_user_field(user_id, custom_bju="")
-        await state.set_state(OnboardingSG.ask_custom_bju_choice)
-        b = InlineKeyboardBuilder()
-        b.button(text="Рассчитать автоматически", callback_data="bju_auto")
-        b.button(text="Ввести свои показатели БЖУ", callback_data="bju_custom")
-        b.button(text="🔙 Назад", callback_data="onboard_back")
-        b.adjust(1)
-        await send_fn(
-            "Желаете ввести конкретные показатели БЖУ, которые вам нужны, или бот рассчитает их автоматически?",
-            reply_markup=b.as_markup(),
-        )
-
-    elif step_name == "entering_custom_bju":
-        save_user_field(user_id, custom_bju="")
-        await state.set_state(OnboardingSG.entering_custom_bju)
-        await send_fn(
-            "Введите свои <b>дневные показатели</b>: белки, жиры, углеводы в формате <code>30 20 300</code>\n"
-            "<i>(Обязательно: указывайте именно дневные показатели БЖУ в граммах на весь день!)</i>:",
-            reply_markup=kb_back_only(),
-        )
-
-    elif step_name == "q1_height":
-        save_user_field(user_id, height=None)
-        await state.set_state(OnboardingSG.q1_height)
-        await send_fn("1. Укажите ваш рост (в см, например: 180):", reply_markup=kb_back_only())
-
-    elif step_name == "q2_weight":
-        save_user_field(user_id, weight=None)
-        await state.set_state(OnboardingSG.q2_weight)
-        await send_fn("2. Укажите ваш вес (в кг, например: 75):", reply_markup=kb_back_only())
-
-    elif step_name == "q3_age":
-        save_user_field(user_id, age=None)
-        await state.set_state(OnboardingSG.q3_age)
-        await send_fn("3. Укажите ваш возраст (полных лет):", reply_markup=kb_back_only())
-
-    elif step_name == "q4_exp":
-        save_user_field(user_id, exp_level=None)
-        await state.set_state(OnboardingSG.q4_exp)
-        b = InlineKeyboardBuilder()
-        b.button(text="Начинающий", callback_data="exp_Начинающий")
-        b.button(text="Любитель", callback_data="exp_Любитель")
-        b.button(text="Профессионал", callback_data="exp_Профессионал")
-        b.button(text="🔙 Назад", callback_data="onboard_back")
-        b.adjust(1)
-        await send_fn("4. Ваш спортивный опыт:", reply_markup=b.as_markup())
-
-    elif step_name == "q5_workouts_btn":
-        save_user_field(user_id, workouts=None)
-        await state.set_state(OnboardingSG.q5_workouts_btn)
-        b = InlineKeyboardBuilder()
-        b.button(text="1-3", callback_data="wrk_1-3")
-        b.button(text="3 и более", callback_data="wrk_3 и более")
-        b.button(text="🔙 Назад", callback_data="onboard_back")
-        b.adjust(2, 1)
-        await send_fn("5. Количество тренировок в неделю:", reply_markup=b.as_markup())
-
-    elif step_name == "q5_workouts_pro_text":
-        save_user_field(user_id, workouts=None)
-        await state.set_state(OnboardingSG.q5_workouts_pro_text)
-        await send_fn("5. Количество тренировок в неделю (напишите точное число):", reply_markup=kb_back_only())
-
-    elif step_name == "q6_goal":
-        save_user_field(user_id, goal=None)
-        await state.set_state(OnboardingSG.q6_goal)
-        b = InlineKeyboardBuilder()
-        b.button(text="Сушка", callback_data="goal_Сушка")
-        b.button(text="Набор мышечной массы", callback_data="goal_Набор мышечной массы")
-        b.button(text="🔙 Назад", callback_data="onboard_back")
-        b.adjust(1)
-        await send_fn("6. Ваша цель:", reply_markup=b.as_markup())
-
-    elif step_name == "q7_supps_choice":
-        save_user_field(user_id, has_supplements=0, supplements_json="{}")
-        await state.set_state(OnboardingSG.q7_supps_choice)
-        b = InlineKeyboardBuilder()
-        b.button(text="Да", callback_data="supps_yes")
-        b.button(text="Нет", callback_data="supps_no")
-        b.button(text="🔙 Назад", callback_data="onboard_back")
-        b.adjust(2, 1)
-        await send_fn(
-            "7. Пользуетесь ли спортивными добавками (креатин, протеин, гейнер, BCAA, фарма/тестостерон и др.)?",
-            reply_markup=b.as_markup(),
-        )
-
-    elif step_name == "q8_supps_list":
-        save_user_field(user_id, supplements_json="{}")
-        await state.set_state(OnboardingSG.q8_supps_list)
-        await send_fn(
-            "8. Какими именно добавками (или препаратами) вы пользуетесь?\n"
-            "Перечислите их через запятую (по желанию укажите БЖУ порции в скобках, например: <i>Протеин (24г белка), Креатин</i>):",
-            reply_markup=kb_back_only(),
-        )
-
-    elif step_name == "q10_allergies":
-        save_user_field(user_id, allergies=None)
-        user = get_user(user_id)
-        q_num = "7" if (user and user.get("exp_level") == "Начинающий") else "10"
-        await state.set_state(OnboardingSG.q10_allergies)
-        await send_fn(f"{q_num}. Укажите противопоказания и аллергии (если нет — напишите «нет»):", reply_markup=kb_back_only())
-
-    elif step_name == "q_budget":
-        save_user_field(user_id, budget=None)
-        await state.set_state(OnboardingSG.q_budget)
-        await send_fn("Укажите ваш бюджет на питание на неделю (в рублях, например: 5000 руб):", reply_markup=kb_back_only())
-
-    elif step_name == "q_stores":
-        save_user_field(user_id, stores=None)
-        await state.set_state(OnboardingSG.q_stores)
-        await send_fn(
-            "Какие продуктовые магазины вы используете?\n"
-            "<i>(Например: Пятёрочка, Перекрёсток, Чижик или просто напишите рынок)</i>:",
-            reply_markup=kb_back_only(),
-        )
-
-    elif step_name == "q_notify_time":
-        await state.set_state(OnboardingSG.q_notify_time)
-        await send_fn(
-            "Во сколько с утра (по московскому времени) присылать вам рацион на весь день?\n"
-            "Введите время в формате <code>ЧЧ:ММ</code> (например: <code>08:00</code>):",
-            reply_markup=kb_back_only(),
-        )
-
-    elif step_name == "q_start_day":
-        save_user_field(user_id, diet_start_date=None)
-        await state.set_state(OnboardingSG.q_start_day)
-        b = InlineKeyboardBuilder()
-        b.button(text="С завтрашнего дня", callback_data="start_day_tomorrow")
-        b.button(text="🔙 Назад", callback_data="onboard_back")
-        b.adjust(1)
-        await send_fn(
-            "С какого дня вы хотите начать рацион?\n"
-            "<i>Напишите день недели (например: вторник), дату (например: 18.12) или нажмите кнопку ниже:</i>",
-            reply_markup=b.as_markup(),
-        )
-
-    elif step_name == "q_ready_meals":
-        await show_macros_advice_step(target_message, state, user_id, is_edit=is_edit)
-
-    elif step_name == "q_custom_meals_count":
-        await state.set_state(OnboardingSG.q_custom_meals_count)
-        await send_fn("Сколько раз в день вы готовы питаться? (Напишите число от 1 до 5):", reply_markup=kb_back_only())
-
-
-# Обработчик кнопки «🔙 Назад» по всей цепочке анкеты
-@router.callback_query(F.data == "onboard_back")
-async def cb_onboard_back(call: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    history = data.get("step_history", [])
-    if len(history) <= 1:
-        await render_onboarding_step(call.message, state, "start_modes", call.from_user.id, is_edit=True)
-        return
-    # Удаляем текущий шаг и возвращаемся к предыдущему, стирая введенные на нем данные
-    history.pop()
-    prev_step = history[-1]
-    await state.update_data(step_history=history)
-    await render_onboarding_step(call.message, state, prev_step, call.from_user.id, is_edit=True)
-
-
-# ==========================================
-# 6. СТАРТ И ОПРОС ПОЛЬЗОВАТЕЛЯ
-# ==========================================
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
-    # Бот всегда помнит пользователя и его данные в БД!
-    save_user_field(message.from_user.id)
-    await message.answer("Выберите режим:", reply_markup=kb_start_modes())
+    u = get_user(message.from_user.id)
+    if u.get("current_diet_json"):
+        text, kb = render_diet_day(message.from_user.id, 0)
+        await message.answer(text, reply_markup=kb, parse_mode="Markdown")
+        return
+    await message.answer("Выберите режим:", reply_markup=main_modes_kb())
 
-
-@router.callback_query(F.data == "back_to_start_modes")
-async def cb_back_to_start_modes(call: CallbackQuery, state: FSMContext):
+@router.callback_query(F.data == "back_to_modes")
+async def cb_back_to_modes(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await call.message.edit_text("Выберите режим:", reply_markup=kb_start_modes())
+    await safe_edit(callback.message, "Выберите режим:", main_modes_kb())
 
+# ==========================================
+# НАВИГАЦИЯ «НАЗАД» ПО ШАГАМ АНКЕТЫ
+# ==========================================
+async def render_onboarding_step(message: Message, state: FSMContext, step: str, uid: int):
+    u = get_user(uid)
+    if step == "bju_choice":
+        await state.set_state(OnboardingSG.bju_choice)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🤖 Рассчитать БЖУ автоматически", callback_data="bju_auto")],
+            [InlineKeyboardButton(text="✍️ Ввести свои дневные показатели", callback_data="bju_manual")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_modes")]
+        ])
+        await safe_edit(message, "Как определим вашу дневную норму БЖУ?", kb)
 
-@router.callback_query(F.data == "mode_diet")
-async def start_diet_mode(call: CallbackQuery, state: FSMContext):
-    user = get_user(call.from_user.id)
-    # Замечание 1: если у пользователя уже есть рассчитанный рацион, бот помнит его и сразу открывает!
-    if user and user.get("current_diet_json"):
+    elif step == "manual_bju_input":
+        await state.set_state(OnboardingSG.manual_bju_input)
+        await safe_edit(
+            message,
+            "Введите свои **дневные** показатели: белки, жиры, углеводы в формате `30 20 300`\n"
+            "*(обратите внимание: указывается общая норма на весь день)*:",
+            back_kb()
+        )
+
+    elif step == "height":
+        await state.set_state(OnboardingSG.height)
+        await safe_edit(message, "1️⃣ Какой у вас рост (в см)?", back_kb())
+
+    elif step == "weight":
+        await state.set_state(OnboardingSG.weight)
+        await safe_edit(message, "2️⃣ Какой у вас вес (в кг)?", back_kb())
+
+    elif step == "age":
+        await state.set_state(OnboardingSG.age)
+        await safe_edit(message, "3️⃣ Сколько вам полных лет?", back_kb())
+
+    elif step == "exp_level":
+        await state.set_state(OnboardingSG.exp_level)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🟢 Начинающий", callback_data="exp_Начинающий")],
+            [InlineKeyboardButton(text="🟡 Любитель", callback_data="exp_Любитель")],
+            [InlineKeyboardButton(text="🔴 Профессионал", callback_data="exp_Профессионал")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="onboard_back")]
+        ])
+        await safe_edit(message, "4️⃣ Ваш уровень подготовки в тренировках?", kb)
+
+    elif step == "workouts":
+        await state.set_state(OnboardingSG.workouts)
+        if u["exp_level"] == "Профессионал":
+            await safe_edit(message, "5️⃣ Напишите точное количество ваших тренировок в неделю (числом):", back_kb())
+        else:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="1–3 тренировки", callback_data="work_1-3")],
+                [InlineKeyboardButton(text="3 и более", callback_data="work_3 и более")],
+                [InlineKeyboardButton(text="🔙 Назад", callback_data="onboard_back")]
+            ])
+            await safe_edit(message, "5️⃣ Сколько раз в неделю вы тренируетесь?", kb)
+
+    elif step == "goal":
+        await state.set_state(OnboardingSG.goal)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔥 Сушка", callback_data="goal_Сушка")],
+            [InlineKeyboardButton(text="💪 Набор мышечной массы", callback_data="goal_Набор мышечной массы")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="onboard_back")]
+        ])
+        await safe_edit(message, "6️⃣ Какая ваша главная цель?", kb)
+
+    elif step == "has_supplements":
+        await state.set_state(OnboardingSG.has_supplements)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Да", callback_data="supp_yes"),
+             InlineKeyboardButton(text="Нет", callback_data="supp_no")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="onboard_back")]
+        ])
+        await safe_edit(message, "7️⃣ Принимаете ли вы какие-либо добавки или спортивное питание?", kb)
+
+    elif step == "supplements_list":
+        await state.set_state(OnboardingSG.supplements_list)
+        await safe_edit(
+            message,
+            "8️⃣ Напишите через запятую какие добавки, спортпит или препараты вы принимаете.\n"
+            "*(Если там есть БЖУ, можете указать рядом)*:",
+            back_kb()
+        )
+
+    elif step == "allergies":
+        await state.set_state(OnboardingSG.allergies)
+        num = "7️⃣" if u["exp_level"] == "Начинающий" else "🔟"
+        await safe_edit(
+            message,
+            f"{num} Есть ли у вас противопоказания, болезни ЖКТ или аллергия на продукты?\n"
+            "*(Напишите подробно или отправьте «Нет»)*:",
+            back_kb()
+        )
+
+    elif step == "budget":
+        await state.set_state(OnboardingSG.budget)
+        await safe_edit(message, "💰 Какой у вас недельный бюджет на питание (в рублях)? Например: `5000`", back_kb())
+
+    elif step == "stores":
+        await state.set_state(OnboardingSG.stores)
+        await safe_edit(
+            message,
+            "🛒 В каких магазинах вы закупаетесь продуктами?\n"
+            "*(Например: Пятёрочка, Перекрёсток, Чижик или просто напишите рынок)*:",
+            back_kb()
+        )
+
+    elif step == "notify_time":
+        await state.set_state(OnboardingSG.notify_time)
+        await safe_edit(
+            message,
+            "⏰ В какое время (по МСК) вам удобно получать утреннее уведомление с рационом на день?\n"
+            "Напишите в формате `ЧЧ:ММ` (например `08:30`):",
+            back_kb()
+        )
+
+    elif step == "start_day_choice":
+        await state.set_state(OnboardingSG.start_day_choice)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⏭ С завтрашнего дня", callback_data="start_tomorrow")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="onboard_back")]
+        ])
+        await safe_edit(
+            message,
+            "📆 С какого дня составить рацион?\n\n"
+            "Рацион формируется минимум со следующего дня, чтобы вы успели ознакомиться со списком и закупить продукты.\n"
+            "Нажмите кнопку **«С завтрашнего дня»** или напишите день недели / дату (например `18.12`):",
+            kb
+        )
+
+@router.callback_query(F.data == "onboard_back")
+async def cb_onboard_back(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    history = data.get("history", [])
+    uid = callback.from_user.id
+
+    if len(history) <= 1:
         await state.clear()
-        diet_data = json.loads(user["current_diet_json"])
-        text = format_weekly_summary_text(user, diet_data, is_next=False)
-        await call.message.edit_text(text, reply_markup=kb_main_app_menu(user, diet_data))
+        await safe_edit(callback.message, "Выберите режим:", main_modes_kb())
         return
 
-    await state.update_data(step_history=["ask_custom_bju_choice"])
-    await render_onboarding_step(call.message, state, "ask_custom_bju_choice", call.from_user.id, is_edit=True)
+    current_step = history.pop()
+    prev_step = history[-1]
+    await state.update_data(history=history)
 
+    # Очищаем предыдущее сохраненное значение при откате назад
+    field_map = {
+        "manual_bju_input": "custom_bju",
+        "height": "height",
+        "weight": "weight",
+        "age": "age",
+        "exp_level": "exp_level",
+        "workouts": "workouts",
+        "goal": "goal",
+        "has_supplements": "has_supplements",
+        "supplements_list": "supplements_json",
+        "allergies": "allergies",
+        "budget": "budget",
+        "stores": "stores",
+        "notify_time": "notify_time"
+    }
+    if current_step in field_map:
+        update_user(uid, **{field_map[current_step]: None})
+    if prev_step in field_map:
+        update_user(uid, **{field_map[prev_step]: None})
 
-@router.callback_query(F.data == "restart_questionnaire")
-async def cb_restart_questionnaire(call: CallbackQuery, state: FSMContext):
+    await render_onboarding_step(callback.message, state, prev_step, uid)
+
+# ==========================================
+# ПРОХОЖДЕНИЕ АНКЕТЫ «РАЦИОН»
+# ==========================================
+@router.callback_query(F.data == "mode_diet")
+async def start_diet_mode(callback: CallbackQuery, state: FSMContext):
+    uid = callback.from_user.id
+    update_user(uid, mode="diet")
+    u = get_user(uid)
+    if u.get("current_diet_json"):
+        await state.clear()
+        text, kb = render_diet_day(uid, 0)
+        await safe_edit(callback.message, text, kb)
+        return
+
     await state.clear()
-    await state.update_data(step_history=["ask_custom_bju_choice"])
-    await render_onboarding_step(call.message, state, "ask_custom_bju_choice", call.from_user.id, is_edit=True)
+    await state.update_data(history=["bju_choice"], prompt_mid=callback.message.message_id)
+    await render_onboarding_step(callback.message, state, "bju_choice", uid)
 
+@router.callback_query(OnboardingSG.bju_choice, F.data.in_({"bju_auto", "bju_manual"}))
+async def process_bju_choice(callback: CallbackQuery, state: FSMContext):
+    uid = callback.from_user.id
+    if callback.data == "bju_auto":
+        update_user(uid, custom_bju=None)
+        await push_step(state, "height")
+        await render_onboarding_step(callback.message, state, "height", uid)
+    else:
+        await push_step(state, "manual_bju_input")
+        await render_onboarding_step(callback.message, state, "manual_bju_input", uid)
 
-@router.callback_query(OnboardingSG.ask_custom_bju_choice, F.data == "bju_auto")
-async def bju_auto_chosen(call: CallbackQuery, state: FSMContext):
-    save_user_field(call.from_user.id, custom_bju="")
-    await push_step(state, "q1_height")
-    await render_onboarding_step(call.message, state, "q1_height", call.from_user.id, is_edit=True)
+@router.message(OnboardingSG.manual_bju_input)
+async def process_manual_bju(message: Message, state: FSMContext):
+    txt = (message.text or "").strip()
+    parts = txt.split()
+    data = await state.get_data()
+    prompt_mid = data.get("prompt_mid")
+    await try_delete_user_msg(message)
 
-
-@router.callback_query(OnboardingSG.ask_custom_bju_choice, F.data == "bju_custom")
-async def bju_custom_chosen(call: CallbackQuery, state: FSMContext):
-    await push_step(state, "entering_custom_bju")
-    await render_onboarding_step(call.message, state, "entering_custom_bju", call.from_user.id, is_edit=True)
-
-
-@router.message(OnboardingSG.entering_custom_bju)
-async def process_custom_bju(message: Message, state: FSMContext):
-    nums = re.findall(r"\d+", message.text or "")
-    if len(nums) < 3:
-        await message.answer(
-            "⚠️ Ответьте на предыдущий вопрос! Введите свои <b>дневные показатели</b> белки, жиры, углеводы в формате <code>30 20 300</code>:",
-            reply_markup=kb_back_only(),
+    if len(parts) != 3 or not all(p.isdigit() for p in parts):
+        await bot.edit_message_text(
+            "⚠️ Неверный формат! Введите 3 целых числа через пробел — ваши **дневные** Белки Жиры Углеводы (например: `140 70 280`):",
+            chat_id=message.chat.id, message_id=prompt_mid, parse_mode="Markdown", reply_markup=back_kb()
         )
         return
-    save_user_field(message.from_user.id, custom_bju=message.text.strip())
-    await push_step(state, "q1_height")
-    await render_onboarding_step(message, state, "q1_height", message.from_user.id, is_edit=False)
 
+    update_user(message.from_user.id, custom_bju=f"{parts[0]} {parts[1]} {parts[2]}")
+    await push_step(state, "height")
+    await bot.edit_message_text("1️⃣ Какой у вас рост (в см)?", chat_id=message.chat.id, message_id=prompt_mid, reply_markup=back_kb())
+    await state.set_state(OnboardingSG.height)
 
-# Вопрос 1: Рост
-@router.message(OnboardingSG.q1_height)
-async def process_q1_height(message: Message, state: FSMContext):
-    if not (message.text and message.text.strip().isdigit() and 100 <= int(message.text.strip()) <= 250):
-        await message.answer("⚠️ Ответьте на предыдущий вопрос! Укажите ваш рост числом в см (от 100 до 250):", reply_markup=kb_back_only())
+@router.message(OnboardingSG.height)
+async def process_height(message: Message, state: FSMContext):
+    txt = (message.text or "").strip()
+    data = await state.get_data()
+    prompt_mid = data.get("prompt_mid")
+    await try_delete_user_msg(message)
+
+    if not txt.isdigit() or not (100 <= int(txt) <= 250):
+        await bot.edit_message_text(
+            "⚠️ Пожалуйста, введите реальный рост в сантиметрах числом (например: `178`):",
+            chat_id=message.chat.id, message_id=prompt_mid, parse_mode="Markdown", reply_markup=back_kb()
+        )
         return
-    save_user_field(message.from_user.id, height=int(message.text.strip()))
-    await push_step(state, "q2_weight")
-    await render_onboarding_step(message, state, "q2_weight", message.from_user.id, is_edit=False)
 
+    update_user(message.from_user.id, height=int(txt))
+    await push_step(state, "weight")
+    await bot.edit_message_text("2️⃣ Какой у вас вес (в кг)?", chat_id=message.chat.id, message_id=prompt_mid, reply_markup=back_kb())
+    await state.set_state(OnboardingSG.weight)
 
-# Вопрос 2: Вес
-@router.message(OnboardingSG.q2_weight)
-async def process_q2_weight(message: Message, state: FSMContext):
-    txt = (message.text or "").replace(",", ".").strip()
+@router.message(OnboardingSG.weight)
+async def process_weight(message: Message, state: FSMContext):
+    txt = (message.text or "").strip().replace(",", ".")
+    data = await state.get_data()
+    prompt_mid = data.get("prompt_mid")
+    await try_delete_user_msg(message)
+
     try:
         w = float(txt)
-        if not (30 <= w <= 250):
+        if not (30 <= w <= 260):
             raise ValueError()
     except ValueError:
-        await message.answer("⚠️ Ответьте на предыдущий вопрос! Укажите ваш точный вес числом в кг:", reply_markup=kb_back_only())
+        await bot.edit_message_text(
+            "⚠️ Введите корректный вес в килограммах числом (например: `75` или `72.5`):",
+            chat_id=message.chat.id, message_id=prompt_mid, parse_mode="Markdown", reply_markup=back_kb()
+        )
         return
-    save_user_field(message.from_user.id, weight=w)
-    await push_step(state, "q3_age")
-    await render_onboarding_step(message, state, "q3_age", message.from_user.id, is_edit=False)
 
+    update_user(message.from_user.id, weight=w)
+    await push_step(state, "age")
+    await bot.edit_message_text("3️⃣ Сколько вам полных лет?", chat_id=message.chat.id, message_id=prompt_mid, reply_markup=back_kb())
+    await state.set_state(OnboardingSG.age)
 
-# Вопрос 3: Возраст
-@router.message(OnboardingSG.q3_age)
-async def process_q3_age(message: Message, state: FSMContext):
-    if not (message.text and message.text.strip().isdigit() and 10 <= int(message.text.strip()) <= 100):
-        await message.answer("⚠️ Ответьте на предыдущий вопрос! Укажите ваш возраст числом:", reply_markup=kb_back_only())
+@router.message(OnboardingSG.age)
+async def process_age(message: Message, state: FSMContext):
+    txt = (message.text or "").strip()
+    data = await state.get_data()
+    prompt_mid = data.get("prompt_mid")
+    await try_delete_user_msg(message)
+
+    if not txt.isdigit() or not (12 <= int(txt) <= 100):
+        await bot.edit_message_text(
+            "⚠️ Введите ваш возраст полным числом (от 12 до 100):",
+            chat_id=message.chat.id, message_id=prompt_mid, reply_markup=back_kb()
+        )
         return
-    save_user_field(message.from_user.id, age=int(message.text.strip()))
-    await push_step(state, "q4_exp")
-    await render_onboarding_step(message, state, "q4_exp", message.from_user.id, is_edit=False)
 
+    update_user(message.from_user.id, age=int(txt))
+    await push_step(state, "exp_level")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🟢 Начинающий", callback_data="exp_Начинающий")],
+        [InlineKeyboardButton(text="🟡 Любитель", callback_data="exp_Любитель")],
+        [InlineKeyboardButton(text="🔴 Профессионал", callback_data="exp_Профессионал")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="onboard_back")]
+    ])
+    await bot.edit_message_text("4️⃣ Ваш уровень подготовки в тренировках?", chat_id=message.chat.id, message_id=prompt_mid, reply_markup=kb)
+    await state.set_state(OnboardingSG.exp_level)
 
-# Вопрос 4: Спортивный опыт
-@router.callback_query(OnboardingSG.q4_exp, F.data.startswith("exp_"))
-async def process_q4_exp(call: CallbackQuery, state: FSMContext):
-    exp = call.data.split("_", 1)[1]
-    save_user_field(call.from_user.id, exp_level=exp)
-    await state.update_data(exp_level=exp)
+@router.callback_query(OnboardingSG.exp_level, F.data.startswith("exp_"))
+async def process_exp_level(callback: CallbackQuery, state: FSMContext):
+    exp = callback.data.split("_", 1)[1]
+    uid = callback.from_user.id
+    update_user(uid, exp_level=exp)
+    await push_step(state, "workouts")
+    await render_onboarding_step(callback.message, state, "workouts", uid)
 
-    if exp in ["Начинающий", "Любитель"]:
-        await push_step(state, "q5_workouts_btn")
-        await render_onboarding_step(call.message, state, "q5_workouts_btn", call.from_user.id, is_edit=True)
+@router.callback_query(OnboardingSG.workouts, F.data.startswith("work_"))
+async def process_workouts_btn(callback: CallbackQuery, state: FSMContext):
+    w_cnt = callback.data.split("_", 1)[1]
+    uid = callback.from_user.id
+    update_user(uid, workouts=w_cnt)
+    await push_step(state, "goal")
+    await render_onboarding_step(callback.message, state, "goal", uid)
+
+@router.message(OnboardingSG.workouts)
+async def process_workouts_pro(message: Message, state: FSMContext):
+    u = get_user(message.from_user.id)
+    data = await state.get_data()
+    prompt_mid = data.get("prompt_mid")
+    await try_delete_user_msg(message)
+
+    if u["exp_level"] != "Профессионал":
+        await bot.send_message(message.chat.id, "⚠️ Ответьте на предыдущий вопрос! Выберите вариант кнопкой.")
+        return
+
+    txt = (message.text or "").strip()
+    if not txt.isdigit() or not (1 <= int(txt) <= 21):
+        await bot.edit_message_text(
+            "⚠️ Введите количество тренировок в неделю числом (от 1 до 21):",
+            chat_id=message.chat.id, message_id=prompt_mid, reply_markup=back_kb()
+        )
+        return
+
+    update_user(message.from_user.id, workouts=txt)
+    await push_step(state, "goal")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔥 Сушка", callback_data="goal_Сушка")],
+        [InlineKeyboardButton(text="💪 Набор мышечной массы", callback_data="goal_Набор мышечной массы")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="onboard_back")]
+    ])
+    await bot.edit_message_text("6️⃣ Какая ваша главная цель?", chat_id=message.chat.id, message_id=prompt_mid, reply_markup=kb)
+    await state.set_state(OnboardingSG.goal)
+
+@router.callback_query(OnboardingSG.goal, F.data.startswith("goal_"))
+async def process_goal(callback: CallbackQuery, state: FSMContext):
+    goal = callback.data.split("_", 1)[1]
+    uid = callback.from_user.id
+    update_user(uid, goal=goal)
+    u = get_user(uid)
+
+    # Умная проверка: если вес >= 90 кг и человек выбрал "Набор мышечной массы"
+    if float(u["weight"] or 0) >= 90 and goal == "Набор мышечной массы":
+        await state.set_state(OnboardingSG.high_weight_confirm)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔥 Переключить на Сушку (Рекомендуется)", callback_data="switch_goal_to_cut")],
+            [InlineKeyboardButton(text="💪 Оставить Набор мышечной массы", callback_data="keep_goal_bulk")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="onboard_back")]
+        ])
+        await safe_edit(
+            callback.message,
+            f"⚠️ **Рекомендация нутрициолога:**\n\n"
+            f"При текущем весе **{u['weight']} кг** профицит калорий и набор массы могут создать лишнюю нагрузку на сердечно-сосудистую систему и суставы, а также увеличить процент жира.\n\n"
+            f"Я рекомендую выбрать режим **«Сушка»** (качественная рекомпозиция с сохранением мышц). Но итоговое решение за вами:",
+            kb
+        )
+        return
+
+    await proceed_after_goal(callback.message, state, uid)
+
+@router.callback_query(OnboardingSG.high_weight_confirm, F.data.in_({"switch_goal_to_cut", "keep_goal_bulk"}))
+async def process_high_weight_decision(callback: CallbackQuery, state: FSMContext):
+    uid = callback.from_user.id
+    if callback.data == "switch_goal_to_cut":
+        update_user(uid, goal="Сушка")
     else:
-        await push_step(state, "q5_workouts_pro_text")
-        await render_onboarding_step(call.message, state, "q5_workouts_pro_text", call.from_user.id, is_edit=True)
+        update_user(uid, goal="Набор мышечной массы")
+    await proceed_after_goal(callback.message, state, uid)
 
-
-# Вопрос 5 (кнопки)
-@router.callback_query(OnboardingSG.q5_workouts_btn, F.data.startswith("wrk_"))
-async def process_q5_btn(call: CallbackQuery, state: FSMContext):
-    wrk = call.data.split("_", 1)[1]
-    save_user_field(call.from_user.id, workouts=wrk)
-    await push_step(state, "q6_goal")
-    await render_onboarding_step(call.message, state, "q6_goal", call.from_user.id, is_edit=True)
-
-
-# Вопрос 5 (текст для Профессионала)
-@router.message(OnboardingSG.q5_workouts_pro_text)
-async def process_q5_pro(message: Message, state: FSMContext):
-    if not (message.text and message.text.strip().isdigit() and 1 <= int(message.text.strip()) <= 21):
-        await message.answer("⚠️ Ответьте на предыдущий вопрос! Укажите точное количество тренировок в неделю числом:", reply_markup=kb_back_only())
-        return
-    save_user_field(message.from_user.id, workouts=message.text.strip())
-    await push_step(state, "q6_goal")
-    await render_onboarding_step(message, state, "q6_goal", message.from_user.id, is_edit=False)
-
-
-# Вопрос 6: Цель
-@router.callback_query(OnboardingSG.q6_goal, F.data.startswith("goal_"))
-async def process_q6_goal(call: CallbackQuery, state: FSMContext):
-    goal = call.data.split("_", 1)[1]
-    save_user_field(call.from_user.id, goal=goal)
-    user = get_user(call.from_user.id)
-    exp = user.get("exp_level", "Начинающий")
-
-    if exp == "Начинающий":
-        save_user_field(call.from_user.id, has_supplements=0, supplements_json="{}")
-        await push_step(state, "q10_allergies")
-        await render_onboarding_step(call.message, state, "q10_allergies", call.from_user.id, is_edit=True)
+async def proceed_after_goal(message: Message, state: FSMContext, uid: int):
+    u = get_user(uid)
+    if u["exp_level"] == "Начинающий":
+        update_user(uid, has_supplements=0, supplements_json="[]")
+        await push_step(state, "allergies")
+        await render_onboarding_step(message, state, "allergies", uid)
     else:
-        await push_step(state, "q7_supps_choice")
-        await render_onboarding_step(call.message, state, "q7_supps_choice", call.from_user.id, is_edit=True)
+        await push_step(state, "has_supplements")
+        await render_onboarding_step(message, state, "has_supplements", uid)
 
-
-# Вопрос 7: Добавки (Да / Нет)
-@router.callback_query(OnboardingSG.q7_supps_choice, F.data.in_(["supps_yes", "supps_no"]))
-async def process_q7_supps(call: CallbackQuery, state: FSMContext):
-    if call.data == "supps_no":
-        save_user_field(call.from_user.id, has_supplements=0, supplements_json="{}")
-        await push_step(state, "q10_allergies")
-        await render_onboarding_step(call.message, state, "q10_allergies", call.from_user.id, is_edit=True)
+@router.callback_query(OnboardingSG.has_supplements, F.data.in_({"supp_yes", "supp_no"}))
+async def process_has_supps(callback: CallbackQuery, state: FSMContext):
+    uid = callback.from_user.id
+    if callback.data == "supp_no":
+        update_user(uid, has_supplements=0, supplements_json="[]")
+        await push_step(state, "allergies")
+        await render_onboarding_step(callback.message, state, "allergies", uid)
     else:
-        save_user_field(call.from_user.id, has_supplements=1)
-        await push_step(state, "q8_supps_list")
-        await render_onboarding_step(call.message, state, "q8_supps_list", call.from_user.id, is_edit=True)
+        update_user(uid, has_supplements=1)
+        await push_step(state, "supplements_list")
+        await render_onboarding_step(callback.message, state, "supplements_list", uid)
 
+@router.message(OnboardingSG.supplements_list)
+async def process_supps_list(message: Message, state: FSMContext):
+    txt = (message.text or "").strip()
+    data = await state.get_data()
+    prompt_mid = data.get("prompt_mid")
+    await try_delete_user_msg(message)
 
-# Вопрос 8: Список добавок -> Вопрос 9
-@router.message(OnboardingSG.q8_supps_list)
-async def process_q8_supps_list(message: Message, state: FSMContext):
-    if not message.text or len(message.text.strip()) < 2:
-        await message.answer("⚠️ Ответьте на предыдущий вопрос! Перечислите ваши добавки через запятую:", reply_markup=kb_back_only())
+    items = [i.strip() for i in txt.split(",") if i.strip()]
+    if not items:
+        await bot.edit_message_text("⚠️ Перечислите добавки через запятую:", chat_id=message.chat.id, message_id=prompt_mid, reply_markup=back_kb())
         return
-    supps = [s.strip() for s in message.text.split(",") if s.strip()]
-    await state.update_data(supps_queue=supps, supps_result={})
-    await state.set_state(OnboardingSG.q9_supps_freq)
-    first_supp = supps[0]
-    await message.answer(
-        f"9. Укажите периодичность и дозировку приема для добавки <b>«{first_supp}»</b>:",
-        reply_markup=kb_back_only(),
+
+    supps_struct = [{"name": it, "freq": ""} for it in items]
+    await state.update_data(supps_struct=supps_struct, supp_idx=0)
+    await state.set_state(OnboardingSG.supplement_freq)
+    await bot.edit_message_text(
+        f"9️⃣ Укажите дозировку и как часто вы принимаете **{items[0]}** (например: `1 порция каждый день после тренировки`):",
+        chat_id=message.chat.id, message_id=prompt_mid, parse_mode="Markdown", reply_markup=back_kb()
     )
 
-
-# Вопрос 9: Периодичность к каждой добавке
-@router.message(OnboardingSG.q9_supps_freq)
-async def process_q9_supps_freq(message: Message, state: FSMContext):
-    if not message.text or len(message.text.strip()) < 1:
-        await message.answer("⚠️ Ответьте на предыдущий вопрос! Укажите периодичность приема:", reply_markup=kb_back_only())
-        return
+@router.message(OnboardingSG.supplement_freq)
+async def process_supp_freq(message: Message, state: FSMContext):
+    txt = (message.text or "").strip()
     data = await state.get_data()
-    queue = data.get("supps_queue", [])
-    result = data.get("supps_result", {})
+    prompt_mid = data.get("prompt_mid")
+    supps_struct = data.get("supps_struct", [])
+    idx = data.get("supp_idx", 0)
+    await try_delete_user_msg(message)
 
-    if queue:
-        current_supp = queue.pop(0)
-        result[current_supp] = message.text.strip()
-        await state.update_data(supps_queue=queue, supps_result=result)
-
-    if queue:
-        next_supp = queue[0]
-        await message.answer(
-            f"9. Укажите периодичность и дозировку приема для добавки <b>«{next_supp}»</b>:",
-            reply_markup=kb_back_only(),
+    supps_struct[idx]["freq"] = txt
+    idx += 1
+    if idx < len(supps_struct):
+        await state.update_data(supps_struct=supps_struct, supp_idx=idx)
+        await bot.edit_message_text(
+            f"9️⃣ Укажите дозировку и частоту приема для **{supps_struct[idx]['name']}**:",
+            chat_id=message.chat.id, message_id=prompt_mid, parse_mode="Markdown", reply_markup=back_kb()
         )
     else:
-        save_user_field(message.from_user.id, supplements_json=json.dumps(result, ensure_ascii=False))
-        await push_step(state, "q10_allergies")
-        await render_onboarding_step(message, state, "q10_allergies", message.from_user.id, is_edit=False)
-
-
-# Вопрос 10 (или 7): Противопоказания и аллергии -> Бюджет
-@router.message(OnboardingSG.q10_allergies)
-async def process_q10_allergies(message: Message, state: FSMContext):
-    if not message.text:
-        await message.answer("⚠️ Ответьте на предыдущий вопрос! Укажите противопоказания и аллергии:", reply_markup=kb_back_only())
-        return
-    save_user_field(message.from_user.id, allergies=message.text.strip())
-    await push_step(state, "q_budget")
-    await render_onboarding_step(message, state, "q_budget", message.from_user.id, is_edit=False)
-
-
-# Вопрос: Бюджет -> Магазины
-@router.message(OnboardingSG.q_budget)
-async def process_q_budget(message: Message, state: FSMContext):
-    if not message.text or not any(ch.isdigit() for ch in message.text):
-        await message.answer("⚠️ Ответьте на предыдущий вопрос! Укажите ваш бюджет (например: 6000):", reply_markup=kb_back_only())
-        return
-    save_user_field(message.from_user.id, budget=message.text.strip())
-    await push_step(state, "q_stores")
-    await render_onboarding_step(message, state, "q_stores", message.from_user.id, is_edit=False)
-
-
-# Вопрос: Магазины -> Время утренней рассылки
-@router.message(OnboardingSG.q_stores)
-async def process_q_stores(message: Message, state: FSMContext):
-    txt = (message.text or "").lower().strip()
-    if not txt or len(txt) < 2:
-        await message.answer("⚠️ Ответьте на предыдущий вопрос! Напишите названия магазинов или рынок:", reply_markup=kb_back_only())
-        return
-    if any(foreign in txt for foreign in ["walmart", "whole foods", "tesco", "carrefour", "aldi", "kroger"]):
-        await message.answer(
-            "⚠️ Бот рассматривает только магазины, которые находятся в России (исключение — рынок). Укажите российские магазины:",
-            reply_markup=kb_back_only(),
+        update_user(message.from_user.id, supplements_json=json.dumps(supps_struct, ensure_ascii=False))
+        await push_step(state, "allergies")
+        await bot.edit_message_text(
+            "🔟 Есть ли у вас противопоказания, болезни ЖКТ или аллергия на продукты?\n*(Напишите подробно или отправьте «Нет»)*:",
+            chat_id=message.chat.id, message_id=prompt_mid, parse_mode="Markdown", reply_markup=back_kb()
         )
-        return
+        await state.set_state(OnboardingSG.allergies)
 
-    save_user_field(message.from_user.id, stores=message.text.strip())
-    await push_step(state, "q_notify_time")
-    await render_onboarding_step(message, state, "q_notify_time", message.from_user.id, is_edit=False)
-
-
-# Вопрос: Время -> С какого дня начать рацион (Замечание 9)
-@router.message(OnboardingSG.q_notify_time)
-async def process_q_notify_time(message: Message, state: FSMContext):
+@router.message(OnboardingSG.allergies)
+async def process_allergies(message: Message, state: FSMContext):
     txt = (message.text or "").strip()
-    if not re.match(r"^([01]\d|2[0-3]):([0-5]\d)$", txt):
-        await message.answer("⚠️ Ответьте на предыдущий вопрос! Укажите время в формате ЧЧ:ММ (например: 08:30):", reply_markup=kb_back_only())
-        return
+    data = await state.get_data()
+    prompt_mid = data.get("prompt_mid")
+    await try_delete_user_msg(message)
 
-    save_user_field(message.from_user.id, notify_time=txt)
-    await push_step(state, "q_start_day")
-    await render_onboarding_step(message, state, "q_start_day", message.from_user.id, is_edit=False)
+    update_user(message.from_user.id, allergies=txt)
+    await push_step(state, "budget")
+    await bot.edit_message_text(
+        "💰 Какой у вас недельный бюджет на питание (в рублях)? Например: `5000`",
+        chat_id=message.chat.id, message_id=prompt_mid, parse_mode="Markdown", reply_markup=back_kb()
+    )
+    await state.set_state(OnboardingSG.budget)
 
+@router.message(OnboardingSG.budget)
+async def process_budget(message: Message, state: FSMContext):
+    txt = re.sub(r"\D", "", message.text or "")
+    data = await state.get_data()
+    prompt_mid = data.get("prompt_mid")
+    await try_delete_user_msg(message)
 
-# Обработка выбора дня старта рациона (кнопка «С завтрашнего дня» или ввод дня недели / даты)
-@router.callback_query(OnboardingSG.q_start_day, F.data == "start_day_tomorrow")
-async def process_start_day_tomorrow(call: CallbackQuery, state: FSMContext):
-    tomorrow = datetime.now(MSK_TZ).date() + timedelta(days=1)
-    save_user_field(call.from_user.id, diet_start_date=tomorrow.strftime("%d.%m.%Y"))
-    await push_step(state, "q_ready_meals")
-    await show_macros_advice_step(call.message, state, call.from_user.id, is_edit=True)
-
-
-@router.message(OnboardingSG.q_start_day)
-async def process_start_day_text(message: Message, state: FSMContext):
-    txt = (message.text or "").lower().strip()
-    today = datetime.now(MSK_TZ).date()
-    chosen_date = None
-
-    b_err = InlineKeyboardBuilder()
-    b_err.button(text="С завтрашнего дня", callback_data="start_day_tomorrow")
-    b_err.button(text="🔙 Назад", callback_data="onboard_back")
-    b_err.adjust(1)
-
-    if txt in ["завтра", "с завтрашнего дня"]:
-        chosen_date = today + timedelta(days=1)
-    elif txt in ["сегодня", "с сегодняшнего дня"]:
-        await message.answer(
-            "⚠️ Рацион составляется только со следующего дня, чтобы вы успели купить продукты! Выберите другой день или нажмите «С завтрашнего дня»:",
-            reply_markup=b_err.as_markup(),
+    if not txt or int(txt) < 1000:
+        await bot.edit_message_text(
+            "⚠️ Укажите реальный недельный бюджет в рублях числом (например: `4500`):",
+            chat_id=message.chat.id, message_id=prompt_mid, parse_mode="Markdown", reply_markup=back_kb()
         )
         return
-    elif txt in WEEKDAYS_MAP:
-        target_wd = WEEKDAYS_MAP[txt]
-        if target_wd == today.weekday():
-            await message.answer(
-                "⚠️ Сегодня уже этот день недели! Рацион составляется только со следующего дня, чтобы вы успели купить продукты. "
-                "Напишите другой день или нажмите «С завтрашнего дня»:",
-                reply_markup=b_err.as_markup(),
+
+    update_user(message.from_user.id, budget=int(txt))
+    await push_step(state, "stores")
+    await bot.edit_message_text(
+        "🛒 В каких магазинах вы закупаетесь продуктами?\n*(Например: Пятёрочка, Перекрёсток, Чижик или просто напишите рынок)*:",
+        chat_id=message.chat.id, message_id=prompt_mid, parse_mode="Markdown", reply_markup=back_kb()
+    )
+    await state.set_state(OnboardingSG.stores)
+
+@router.message(OnboardingSG.stores)
+async def process_stores(message: Message, state: FSMContext):
+    txt = (message.text or "").strip()
+    data = await state.get_data()
+    prompt_mid = data.get("prompt_mid")
+    await try_delete_user_msg(message)
+
+    if len(txt) < 2:
+        await bot.edit_message_text(
+            "⚠️ Напишите название хотя бы одного магазина или «рынок»:",
+            chat_id=message.chat.id, message_id=prompt_mid, reply_markup=back_kb()
+        )
+        return
+
+    update_user(message.from_user.id, stores=txt)
+    await push_step(state, "notify_time")
+    await bot.edit_message_text(
+        "⏰ В какое время (по МСК) вам удобно получать утреннее уведомление с рационом на день?\nНапишите в формате `ЧЧ:ММ` (например `08:30`):",
+        chat_id=message.chat.id, message_id=prompt_mid, parse_mode="Markdown", reply_markup=back_kb()
+    )
+    await state.set_state(OnboardingSG.notify_time)
+
+@router.message(OnboardingSG.notify_time)
+async def process_notify_time(message: Message, state: FSMContext):
+    txt = (message.text or "").strip()
+    data = await state.get_data()
+    prompt_mid = data.get("prompt_mid")
+    await try_delete_user_msg(message)
+
+    if not re.match(r"^([01]\d|2[0-3]):([0-5]\d)$", txt):
+        await bot.edit_message_text(
+            "⚠️ Неверный формат времени! Введите время по МСК в формате `ЧЧ:ММ`, например `08:00`:",
+            chat_id=message.chat.id, message_id=prompt_mid, parse_mode="Markdown", reply_markup=back_kb()
+        )
+        return
+
+    update_user(message.from_user.id, notify_time=txt)
+    await push_step(state, "start_day_choice")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⏭ С завтрашнего дня", callback_data="start_tomorrow")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="onboard_back")]
+    ])
+    await bot.edit_message_text(
+        "📆 С какого дня составить рацион?\n\n"
+        "Рацион формируется минимум со следующего дня, чтобы вы успели ознакомиться со списком и закупить продукты.\n"
+        "Нажмите кнопку **«С завтрашнего дня»** или напишите день недели / дату (например `18.12`):",
+        chat_id=message.chat.id, message_id=prompt_mid, parse_mode="Markdown", reply_markup=kb
+    )
+    await state.set_state(OnboardingSG.start_day_choice)
+
+@router.callback_query(OnboardingSG.start_day_choice, F.data == "start_tomorrow")
+async def process_start_tomorrow(callback: CallbackQuery, state: FSMContext):
+    tomorrow = (get_msk_now() + timedelta(days=1)).strftime("%Y-%m-%d")
+    update_user(callback.from_user.id, diet_start_date=tomorrow)
+    await show_bju_and_meals_question(callback.message, state, callback.from_user.id)
+
+@router.message(OnboardingSG.start_day_choice)
+async def process_start_day_text(message: Message, state: FSMContext):
+    txt = (message.text or "").strip().lower()
+    data = await state.get_data()
+    prompt_mid = data.get("prompt_mid")
+    await try_delete_user_msg(message)
+
+    now = get_msk_now()
+    weekdays_map = {
+        "понедельник": 0, "вторник": 1, "среда": 2, "среду": 2,
+        "четверг": 3, "пятница": 4, "пятницу": 4, "суббота": 5, "субботу": 5, "воскресенье": 6
+    }
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⏭ С завтрашнего дня", callback_data="start_tomorrow")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="onboard_back")]
+    ])
+
+    target_dt = None
+    if txt in ["сегодня", now.strftime("%d.%m"), now.strftime("%d.%m.%Y")]:
+        await bot.edit_message_text(
+            "⚠️ **На сегодняшний день рацион не составляется!**\n"
+            "Рацион формируется минимум со следующего дня, чтобы вы успели подготовиться и купить продукты в магазине.\n\n"
+            "Выберите **«С завтрашнего дня»** или укажите будущую дату:",
+            chat_id=message.chat.id, message_id=prompt_mid, parse_mode="Markdown", reply_markup=kb
+        )
+        return
+
+    if txt in weekdays_map:
+        w_target = weekdays_map[txt]
+        if w_target == now.weekday():
+            await bot.edit_message_text(
+                "⚠️ Вы указали сегодняшний день недели! Рацион составляется минимум со следующего дня, чтобы вы успели купить продукты.\n\n"
+                "Нажмите **«С завтрашнего дня»** или укажите другой день:",
+                chat_id=message.chat.id, message_id=prompt_mid, parse_mode="Markdown", reply_markup=kb
             )
             return
-        days_ahead = (target_wd - today.weekday()) % 7
-        chosen_date = today + timedelta(days=days_ahead)
+        days_ahead = (w_target - now.weekday() + 7) % 7
+        target_dt = now + timedelta(days=days_ahead)
     else:
         m = re.match(r"^(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?$", txt)
         if m:
-            day_i, mon_i = int(m.group(1)), int(m.group(2))
-            yr_i = int(m.group(3)) if m.group(3) else today.year
+            d, mo, yr = int(m.group(1)), int(m.group(2)), int(m.group(3) or now.year)
             try:
-                candidate = datetime(yr_i, mon_i, day_i).date()
-                if not m.group(3) and candidate < today:
-                    candidate = datetime(yr_i + 1, mon_i, day_i).date()
-                if candidate <= today:
-                    await message.answer(
-                        "⚠️ Рацион составляется только со следующего дня (минимум с завтрашнего числа), чтобы вы успели купить продукты!",
-                        reply_markup=b_err.as_markup(),
+                cand = MSK_TZ.localize(datetime(yr, mo, d))
+                if cand.date() <= now.date():
+                    await bot.edit_message_text(
+                        "⚠️ Дата должна быть не раньше завтрашнего дня, чтобы вы успели закупить продукты! Укажите будущую дату или нажмите кнопку ниже:",
+                        chat_id=message.chat.id, message_id=prompt_mid, parse_mode="Markdown", reply_markup=kb
                     )
                     return
-                chosen_date = candidate
-            except ValueError:
+                target_dt = cand
+            except Exception:
                 pass
 
-    if not chosen_date:
-        await message.answer(
-            "⚠️ Напишите корректный день недели (например: <code>вторник</code>), дату (например: <code>18.12</code>) или нажмите кнопку ниже:",
-            reply_markup=b_err.as_markup(),
+    if not target_dt:
+        await bot.edit_message_text(
+            "⚠️ Не удалось распознать день. Нажмите кнопку **«С завтрашнего дня»** или введите дату в формате `ДД.ММ`:",
+            chat_id=message.chat.id, message_id=prompt_mid, parse_mode="Markdown", reply_markup=kb
         )
         return
 
-    save_user_field(message.from_user.id, diet_start_date=chosen_date.strftime("%d.%m.%Y"))
-    await push_step(state, "q_ready_meals")
-    await show_macros_advice_step(message, state, message.from_user.id, is_edit=False)
+    update_user(message.from_user.id, diet_start_date=target_dt.strftime("%Y-%m-%d"))
+    msg_obj = await bot.edit_message_text("⏳ Рассчитываю ваши показатели...", chat_id=message.chat.id, message_id=prompt_mid)
+    await show_bju_and_meals_question(msg_obj, state, message.from_user.id)
 
-
-async def show_macros_advice_step(target_message: Message, state: FSMContext, user_id: int, is_edit: bool = False):
-    send_fn = target_message.edit_text if is_edit else target_message.answer
-    wait_m = await send_fn("⏳ <b>Анализирую ваши параметры и рассчитываю оптимальные показатели БЖУ...</b>")
-
-    user = get_user(user_id)
-    macros = await asyncio.to_thread(calculate_macros, user)
-
-    save_user_field(
-        user_id,
-        target_p=macros["p"],
-        target_f=macros["f"],
-        target_c=macros["c"],
-        target_fiber=macros["fiber"],
-        rec_meals=macros["rec_meals"],
-        expert_note=macros.get("expert_note", ""),
+async def show_bju_and_meals_question(message: Message, state: FSMContext, uid: int):
+    u = get_user(uid)
+    calc = await calculate_smart_bju_and_meals(u)
+    update_user(
+        uid,
+        target_p=calc["p"],
+        target_f=calc["f"],
+        target_c=calc["c"],
+        target_fiber=calc["fiber"],
+        rec_meals=calc["rec_meals"],
+        expert_note=calc["note"]
     )
+    u = get_user(uid)
 
-    supps_dict = json.loads(user.get("supplements_json") or "{}")
-    supps_str = ", ".join([f"{k} ({v})" for k, v in supps_dict.items()]) if supps_dict else "Нет"
-
-    # Важная карточка пользователя сохраняется в диалоге
-    profile_msg = (
-        "📌 <b>Ваша карточка данных:</b>\n"
-        f"• Рост / Вес / Возраст: {user['height']} см / {user['weight']} кг / {user['age']} лет\n"
-        f"• Опыт: {user['exp_level']} (тренировок в нед: {user['workouts']})\n"
-        f"• Цель: {user['goal']}\n"
-        f"• Добавки: {supps_str}\n"
-        f"• Аллергии/противопоказания: {user['allergies']}\n"
-        f"• Бюджет: {user['budget']} | Магазины: {user['stores']}\n"
-        f"• Старт рациона: с {user['diet_start_date'][:5]} | Уведомления: {user['notify_time']} МСК"
+    # Сохраняем важную карточку профиля и БЖУ отдельным сообщением в чате, чтобы она не пропадала
+    summary_card = (
+        f"📌 **Ваша персональная карта питания**\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"👤 Параметры: {u['height']} см | {u['weight']} кг | {u['age']} лет\n"
+        f"🏋️ Уровень: {u['exp_level']} ({u['workouts']} тр./нед.)\n"
+        f"🎯 Цель: **{u['goal']}**\n"
+        f"🛒 Магазины: {u['stores']} (бюджет ~{u['budget']} ₽/нед.)\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"📊 **Дневная норма БЖУ:**\n"
+        f"• Белки: **{calc['p']} г**\n"
+        f"• Жиры: **{calc['f']} г**\n"
+        f"• Углеводы: **{calc['c']} г**\n"
+        f"• Клетчатка: **{calc['fiber']} г**\n"
+        f"💡 _{calc['note']}_"
     )
-    await target_message.answer(profile_msg)
+    await bot.send_message(message.chat.id, summary_card, parse_mode="Markdown")
 
-    await state.set_state(OnboardingSG.q_ready_meals)
-    b = InlineKeyboardBuilder()
-    b.button(text="Да, готов", callback_data="meals_ready_yes")
-    b.button(text="Нет (выбрать другое кол-во)", callback_data="meals_ready_no")
-    if macros.get("heavy_mass_warning"):
-        b.button(text="🔄 Сменить цель на Сушку (рекомендуется)", callback_data="switch_goal_to_cut")
-    b.button(text="🔙 Назад", callback_data="onboard_back")
-    b.adjust(2, 1, 1)
-
-    extra_warnings = []
-    if macros.get("heavy_mass_warning"):
-        extra_warnings.append(
-            f"⚠️ <b>Обратите внимание (совет эксперта):</b> При текущем весе <b>{user['weight']} кг</b> классический профицитный набор массы "
-            "может создать лишнюю нагрузку на организм и привести к набору жировой ткани. Опираясь на проверенные источники, "
-            "мы рекомендуем выбрать <b>Сушку / рекомпозицию</b> (снижение жира при сохранении мышц). Но окончательный выбор, конечно, за вами!"
-        )
-    if macros.get("high_protein_sport_hint"):
-        extra_warnings.append(
-            f"💡 <b>Пояснение по белку ({macros['p']} г/день):</b> Съедать такое количество белка из обычной еды за 5-6 раз в день очень тяжело. "
-            "Большинство спортсменов в таком случае питаются 3–4 раза в день и добавляют <b>протеин или гейнер</b> между приемами пищи."
-        )
-    if macros.get("expert_note"):
-        extra_warnings.append(f"🧠 <i>Комментарий нутрициолога: {macros['expert_note']}</i>")
-
-    warn_block = ("\n\n" + "\n\n".join(extra_warnings)) if extra_warnings else ""
-
-    advice_msg = (
-        f"💡 <b>Рекомендация по вашему рациону:</b>\n"
-        f"Вам необходимо потреблять в день:\n"
-        f"• Белки: <b>{macros['p']} г</b>\n"
-        f"• Углеводы: <b>{macros['c']} г</b>\n"
-        f"• Жиры (минимум): <b>{macros['f']} г</b>\n"
-        f"• Клетчатка: <b>{macros['fiber']} г</b>"
-        f"{warn_block}\n\n"
-        f"Для такого рациона рекомендуется <b>{macros['rec_meals']}-разовое питание</b> в день.\n"
-        f"<b>Готовы?</b>"
-    )
-    await wait_m.edit_text(advice_msg, reply_markup=b.as_markup())
-
-
-@router.callback_query(OnboardingSG.q_ready_meals, F.data == "switch_goal_to_cut")
-async def cb_switch_goal_to_cut(call: CallbackQuery, state: FSMContext):
-    save_user_field(call.from_user.id, goal="Сушка")
-    await call.answer("✅ Цель изменена на «Сушка»! Пересчитываю БЖУ...")
-    await show_macros_advice_step(call.message, state, call.from_user.id, is_edit=True)
-
-
-@router.callback_query(OnboardingSG.q_ready_meals, F.data == "meals_ready_yes")
-async def process_meals_ready_yes(call: CallbackQuery, state: FSMContext):
-    user = get_user(call.from_user.id)
-    save_user_field(call.from_user.id, actual_meals=user["rec_meals"])
-    await push_step(state, "q_sport_nutr_mode")
-    await state.set_state(OnboardingSG.q_sport_nutr_mode)
-
-    b = InlineKeyboardBuilder()
-    b.button(text="Со спортивным питанием", callback_data="sport_mode_yes")
-    b.button(text="Без него", callback_data="sport_mode_no")
-    b.button(text="🔙 Назад", callback_data="onboard_back")
-    b.adjust(1)
-
-    await call.message.edit_text(
-        f"Отлично! Формируем {user['rec_meals']}-разовое питание.\n"
-        "Уточните, рассчитывать рацион со спортивным питанием или без него?",
-        reply_markup=b.as_markup(),
-    )
-
-
-@router.callback_query(OnboardingSG.q_ready_meals, F.data == "meals_ready_no")
-async def process_meals_ready_no(call: CallbackQuery, state: FSMContext):
-    await push_step(state, "q_custom_meals_count")
-    await render_onboarding_step(call.message, state, "q_custom_meals_count", call.from_user.id, is_edit=True)
-
-
-@router.message(OnboardingSG.q_custom_meals_count)
-async def process_custom_meals_count(message: Message, state: FSMContext):
-    if not (message.text and message.text.strip().isdigit() and 1 <= int(message.text.strip()) <= 5):
-        await message.answer("⚠️ Ответьте на предыдущий вопрос! Напишите число приемов пищи от 1 до 5:", reply_markup=kb_back_only())
-        return
-
-    meals = int(message.text.strip())
-    save_user_field(message.from_user.id, actual_meals=meals)
-    await push_step(state, "q_sport_nutr_mode")
-    await state.set_state(OnboardingSG.q_sport_nutr_mode)
-
-    b = InlineKeyboardBuilder()
-    b.button(text="Со спортивным питанием", callback_data="sport_mode_yes")
-    b.button(text="Без него", callback_data="sport_mode_no")
-    b.button(text="🔙 Назад", callback_data="onboard_back")
-    b.adjust(1)
-
-    warn_text = (
-        f"⚠️ <b>Обратите внимание:</b> {meals} приемов пищи в день может быть мало для полного усвоения вашей нормы из обычных продуктов.\n\n"
-        "Но вы можете добавить <b>гейнер или протеин (с углеводами)</b> между приемами пищи, чтобы легко добирать норму БЖУ.\n\n"
-        "Как рассчитываем ваш рацион?"
-    )
-    await message.answer(warn_text, reply_markup=b.as_markup())
-
-
-@router.callback_query(OnboardingSG.q_sport_nutr_mode, F.data.in_(["sport_mode_yes", "sport_mode_no"]))
-async def finalize_and_generate_diet(call: CallbackQuery, state: FSMContext):
-    use_sport = 1 if call.data == "sport_mode_yes" else 0
-    user_id = call.from_user.id
-    save_user_field(user_id, use_sport_nutr=use_sport, shopping_list_cache="")
-    await state.clear()
-
-    await call.message.edit_text("⏳ <b>Составляю практичный рацион под ваши магазины и рассчитываю граммовки... (около 15-20 секунд)</b>")
-    user = get_user(user_id)
-    diet_data = await asyncio.to_thread(generate_weekly_diet_ai, user, False, None)
-    now_str = datetime.now(MSK_TZ).strftime("%d.%m.%Y")
-    save_user_field(
-        user_id,
-        current_diet_json=json.dumps(diet_data, ensure_ascii=False),
-        last_month_check=now_str,
-    )
-
-    user = get_user(user_id)
-    summary_text = format_weekly_summary_text(user, diet_data, is_next=False)
-    await call.message.edit_text(summary_text, reply_markup=kb_main_app_menu(user, diet_data))
-
-    # Замечание 10: предлагаем контроль за продуктами ТОЛЬКО ОДИН РАЗ и только если пользователь еще им не пользуется!
-    existing_prods = get_products_db(user_id)
-    if not existing_prods and not user.get("offered_fridge"):
-        save_user_field(user_id, offered_fridge=1)
-        b_fr = InlineKeyboardBuilder()
-        b_fr.button(text="📦 Контроль продуктов", callback_data="open_fridge_app")
-        await call.message.answer(
-            "💡 Вы также можете включить функцию <b>Контроль за продуктами</b>, чтобы бот следил за сроками годности и напоминал о них.",
-            reply_markup=b_fr.as_markup(),
+    high_p_advice = ""
+    if calc["p"] >= 165:
+        high_p_advice = (
+            "\n\n💡 **Совет тренера:** При высокой норме белка кушать 5 раз в день только обычной твердой пищей бывает тяжело. "
+            "Большинство людей в таком случае питаются **3–4 раза в день**, а остаток добирают порцией протеина или гейнера."
         )
 
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"✅ Да, готов ({calc['rec_meals']} приемов)", callback_data="meals_ready_yes")],
+        [InlineKeyboardButton(text="❌ Нет, хочу меньше приемов", callback_data="meals_ready_no")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="onboard_back")]
+    ])
 
-# ==========================================
-# 7. НАВИГАЦИЯ ПО РАЦИОНУ, СПИСКУ ПОКУПОК И РЕЦЕПТАМ
-# ==========================================
-def format_weekly_summary_text(user: dict, diet_data: dict, is_next: bool = False) -> str:
-    """Презентабельное, краткое и информативное оформление рациона с датами ДД.ММ."""
-    ws = diet_data.get("weekly_summary", {})
-    days = diet_data.get("days", [])
-    period_str = f"{days[0]['day_name']} – {days[-1]['day_name']}" if days else ""
-    title = f"🥗 <b>РАЦИОН НА СЛЕДУЮЩУЮ НЕДЕЛЮ ({period_str})</b>" if is_next else f"🥗 <b>ВАШ РАЦИОН НА НЕДЕЛЮ ({period_str})</b>"
-    sport_status = "Со спортпитом" if user.get("use_sport_nutr") else "Обычные продукты"
-
-    lines = [
-        f"{title}",
-        f"━━━━━━━━━━━━━━━━━━━━",
-        f"🍽 <b>Приемов пищи:</b> {user.get('actual_meals')} ({sport_status})",
-        f"📊 <b>Дневная норма:</b> Б: <b>{ws.get('daily_p')}г</b> | Ж: <b>{ws.get('daily_f')}г</b> | У: <b>{ws.get('daily_c')}г</b>",
-        f"📈 <b>Всего за неделю:</b> Б: <b>{ws.get('week_p')}г</b> | Ж: <b>{ws.get('week_f')}г</b> | У: <b>{ws.get('week_c')}г</b>",
-        f"━━━━━━━━━━━━━━━━━━━━",
-        "<b>Краткое меню по датам:</b>\n",
-    ]
-    for d in days:
-        dishes = " • ".join([m["dish_name"] for m in d.get("meals", [])])
-        lines.append(f"🔹 <b>{d['day_name']}</b> <i>(Б:{d['p']} Ж:{d['f']} У:{d['c']})</i>:\n   {dishes}\n")
-
-    lines.append(
-        "🛒 <i>Нужен список покупок с ценами под ваши магазины? Нажмите кнопку <b>«Список продуктов к покупке»</b> ниже!</i>\n"
-        "👇 <i>Выберите дату, чтобы открыть граммовки и пошаговые рецепты:</i>"
+    q_text = (
+        f"🍽 Чтобы комфортно усвоить вашу норму (по ~30 г белка за раз без перегрузки ЖКТ), "
+        f"рекомендуется **{calc['rec_meals']} приемов пищи** в день.{high_p_advice}\n\n"
+        f"Готовы ли вы питаться **{calc['rec_meals']} раза в день**?"
     )
-    return "\n".join(lines)
-
-
-def format_day_text_and_kb(diet_data: dict, day_num: int, week_type: str = "curr") -> tuple[str, InlineKeyboardMarkup]:
-    days = diet_data.get("days", [])
-    day_obj = next((d for d in days if int(d.get("day_num", 1)) == day_num), days[0])
-
-    lines = [
-        f"🍽 <b>Меню на {day_obj['day_name']}</b>",
-        f"📊 <b>БЖУ за день:</b> Белки <b>{day_obj['p']}г</b> | Жиры <b>{day_obj['f']}г</b> | Углеводы <b>{day_obj['c']}г</b>",
-        "━━━━━━━━━━━━━━━━━━━━\n",
-    ]
-
-    b = InlineKeyboardBuilder()
-
-    for m in day_obj.get("meals", []):
-        m_num = m["meal_num"]
-        lines.append(
-            f"🔸 <b>{m['meal_title']}: {m['dish_name']}</b>\n"
-            f"   • <i>Состав:</i> {m['ingredients']}\n"
-            f"   • <i>БЖУ:</i> Б: {m['p']}г | Ж: {m['f']}г | У: {m['c']}г\n"
-        )
-        b.button(
-            text=f"📖 Рецепт: {m['dish_name'][:25]}",
-            callback_data=f"recipe_{week_type}_{day_num}_{m_num}",
-        )
-        b.button(
-            text=f"🔄 Заменить прием {m_num}",
-            callback_data=f"repmeal_{week_type}_{day_num}_{m_num}",
-        )
-
-    b.button(text=f"🔄 Заменить весь день ({day_obj['day_name']})", callback_data=f"repday_{week_type}_{day_num}")
-    back_cb = "view_week_summary" if week_type == "curr" else "view_next_week"
-    b.button(text="🔙 Назад к рациону на неделю", callback_data=back_cb)
-    b.adjust(2)
-    return "\n".join(lines), b.as_markup()
-
-
-@router.callback_query(F.data == "view_week_summary")
-async def cb_view_week_summary(call: CallbackQuery, state: FSMContext):
-    await state.clear()
-    user = get_user(call.from_user.id)
-    if not user or not user.get("current_diet_json"):
-        await start_diet_mode(call, state)
-        return
-    diet_data = json.loads(user["current_diet_json"])
-    text = format_weekly_summary_text(user, diet_data, is_next=False)
-    await call.message.edit_text(text, reply_markup=kb_main_app_menu(user, diet_data))
-
-
-# Список продуктов к покупке (Замечание 7 и 13)
-@router.callback_query(F.data == "view_shopping_list")
-async def cb_view_shopping_list(call: CallbackQuery):
-    user = get_user(call.from_user.id)
-    diet_data = json.loads(user["current_diet_json"])
-    await call.message.edit_text(
-        f"⏳ <b>Проверяю источники, актуальные цены и наличие товаров в ваших магазинах ({user['stores']})...</b>"
-    )
-    shop_text = await asyncio.to_thread(generate_shopping_list_ai, user, diet_data)
-    b = InlineKeyboardBuilder()
-    b.button(text="🔄 Обновить список покупок", callback_data="refresh_shopping_list")
-    b.button(text="🔙 Назад к рациону", callback_data="view_week_summary")
-    b.adjust(1)
-    await call.message.edit_text(shop_text, reply_markup=b.as_markup())
-
-
-@router.callback_query(F.data == "refresh_shopping_list")
-async def cb_refresh_shopping_list(call: CallbackQuery):
-    save_user_field(call.from_user.id, shopping_list_cache="")
-    await cb_view_shopping_list(call)
-
-
-# Вписать купленный дополнительный продукт в существующий рацион (Замечание 11)
-@router.callback_query(F.data == "insert_bought_prod")
-async def cb_insert_bought_prod(call: CallbackQuery, state: FSMContext):
-    await state.set_state(EditProfileSG.insert_bought_product)
-    b = InlineKeyboardBuilder()
-    b.button(text="🔙 Назад", callback_data="view_week_summary")
-    await call.message.edit_text(
-        "🥑 <b>Добавление купленного продукта в ваш рацион</b>\n\n"
-        "Напишите, какой дополнительный продукт (и примерно в каком количестве) вы купили "
-        "<i>(например: «Купил 400г творога 5% и бананы» или «Стейк горбуши 500г»)</i>.\n\n"
-        "Я как ваш тренер и нутрициолог рассчитаю его БЖУ, подскажу, куда лучше его вписать или что им заменить, и обновлю ваш рацион!",
-        reply_markup=b.as_markup(),
-    )
-
-
-@router.message(EditProfileSG.insert_bought_product)
-async def msg_insert_bought_prod(message: Message, state: FSMContext):
-    bought_text = (message.text or "").strip()
-    if len(bought_text) < 2:
-        await message.answer("⚠️ Напишите название купленного продукта:", reply_markup=kb_back_only("view_week_summary"))
-        return
-
-    user_id = message.from_user.id
-    user = get_user(user_id)
-    diet_data = json.loads(user["current_diet_json"])
-    await state.clear()
-
-    wait_m = await message.answer("⏳ <b>Считаю БЖУ вашего продукта и вписываю его в существующий рацион...</b>")
-
-    sys_p = (
-        "Ты — профессиональный фитнес-тренер и нутрициолог. "
-        "Пользователь купил дополнительный продукт. Рассчитай его примерное БЖУ, дай умный совет, в какой прием пищи и вместо чего (или дополнительно) его лучше съесть, "
-        "и обнови JSON рациона, вписав этот продукт в подходящие дни и приемы пищи с сохранением дневного баланса БЖУ."
-    )
-    usr_p = f"""
-Купленный продукт: {bought_text}
-Цель пользователя: {user['goal']}, Дневное БЖУ: Б:{user['target_p']} Ж:{user['target_f']} У:{user['target_c']}.
-Текущий рацион JSON: {json.dumps(diet_data, ensure_ascii=False)}
-
-Верни ответ СТРОГО в формате JSON:
-{{
-  "trainer_advice": "Подробный совет тренера: сколько БЖУ в купленном продукте и как именно он был вписан/заменен в рационе",
-  "updated_diet": {{ ...полный обновленный объект рациона (weekly_summary и days)... }}
-}}
-"""
-    raw = await asyncio.to_thread(giga.ask, sys_p, usr_p, 0.4)
-    trainer_advice = (
-        f"✅ <b>Продукт «{bought_text}» проанализирован и вписан в ваш рацион!</b>\n"
-        "Я заменил им один из белково-углеводных приемов пищи с сохранением вашей суточной нормы БЖУ."
-    )
+    new_prompt = await bot.send_message(message.chat.id, q_text, parse_mode="Markdown", reply_markup=kb)
     try:
-        m = re.search(r"\{.*\}", raw, re.DOTALL)
-        if m:
-            parsed = json.loads(m.group(0))
-            if "trainer_advice" in parsed:
-                trainer_advice = f"👨‍⚕️ <b>Совет вашего нутрициолога по продукту «{bought_text}»:</b>\n\n{parsed['trainer_advice']}"
-            if "updated_diet" in parsed and "days" in parsed["updated_diet"]:
-                diet_data = parsed["updated_diet"]
-                save_user_field(user_id, current_diet_json=json.dumps(diet_data, ensure_ascii=False), shopping_list_cache="")
-    except Exception as e:
-        logging.error(f"Insert bought product parse error: {e}")
-        # Если JSON оказался слишком большим, гарантированно вписываем продукт в 1-й и 3-й дни рациона
-        if diet_data.get("days"):
-            diet_data["days"][0]["meals"][-1]["dish_name"] += f" + {bought_text}"
-            diet_data["days"][0]["meals"][-1]["ingredients"] += f", {bought_text}"
-            save_user_field(user_id, current_diet_json=json.dumps(diet_data, ensure_ascii=False), shopping_list_cache="")
+        await message.delete()
+    except Exception:
+        pass
+    await state.update_data(prompt_mid=new_prompt.message_id)
+    await state.set_state(OnboardingSG.meals_ready_choice)
 
-    b = InlineKeyboardBuilder()
-    b.button(text="🥗 Открыть обновленный рацион", callback_data="view_week_summary")
-    await wait_m.edit_text(trainer_advice, reply_markup=b.as_markup())
+@router.callback_query(OnboardingSG.meals_ready_choice, F.data == "meals_ready_yes")
+async def process_meals_ready_yes(callback: CallbackQuery, state: FSMContext):
+    u = get_user(callback.from_user.id)
+    update_user(callback.from_user.id, actual_meals=u["rec_meals"])
+    await ask_sport_nutr_choice(callback.message, state)
 
+@router.callback_query(OnboardingSG.meals_ready_choice, F.data == "meals_ready_no")
+async def process_meals_ready_no(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(OnboardingSG.meals_count_input)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="3 приема", callback_data="setmeals_3"),
+         InlineKeyboardButton(text="4 приема", callback_data="setmeals_4")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="onboard_back")]
+    ])
+    await safe_edit(callback.message, "Выберите комфортное количество приемов пищи в день (3 или 4):", kb)
 
-@router.callback_query(F.data.startswith("view_day_"))
-async def cb_view_day(call: CallbackQuery):
-    _, _, day_str, week_type = call.data.split("_")
-    day_num = int(day_str)
-    user = get_user(call.from_user.id)
-    json_field = "current_diet_json" if week_type == "curr" else "next_diet_json"
-    diet_data = json.loads(user.get(json_field) or user["current_diet_json"])
-    text, kb = format_day_text_and_kb(diet_data, day_num, week_type)
-    await call.message.edit_text(text, reply_markup=kb)
+@router.callback_query(OnboardingSG.meals_count_input, F.data.startswith("setmeals_"))
+async def process_setmeals(callback: CallbackQuery, state: FSMContext):
+    m_cnt = int(callback.data.split("_")[1])
+    update_user(callback.from_user.id, actual_meals=m_cnt)
+    await ask_sport_nutr_choice(callback.message, state)
 
+async def ask_sport_nutr_choice(message: Message, state: FSMContext):
+    await state.set_state(OnboardingSG.sport_nutr_choice)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🥤 Со спортивным питанием", callback_data="sportnutr_1")],
+        [InlineKeyboardButton(text="🍗 Без него (только обычная еда)", callback_data="sportnutr_0")]
+    ])
+    await safe_edit(
+        message,
+        "Как составить ваш рацион: **со спортивным питанием** (протеин/гейнер поможет легко закрыть норму) или **без него**?",
+        kb
+    )
+
+@router.callback_query(OnboardingSG.sport_nutr_choice, F.data.startswith("sportnutr_"))
+async def process_sport_nutr_final(callback: CallbackQuery, state: FSMContext):
+    use_sn = int(callback.data.split("_")[1])
+    uid = callback.from_user.id
+    u = get_user(uid)
+
+    # Если человек выбрал меньше приемов пищи и БЕЗ спортпита — ограничиваем БЖУ под реальное усвоение за прием (до 35г белка и 75г углеводов)
+    if use_sn == 0 and u["actual_meals"] < u["rec_meals"]:
+        max_p = u["actual_meals"] * 35
+        max_c = u["actual_meals"] * 75
+        new_p = min(u["target_p"], max_p)
+        new_c = min(u["target_c"], max_c)
+        update_user(uid, use_sport_nutr=0, target_p=new_p, target_c=new_c)
+    else:
+        update_user(uid, use_sport_nutr=use_sn)
+
+    await state.clear()
+    await safe_edit(callback.message, "⏳ **Составляю ваш рацион на 7 дней из простых и доступных блюд...**\n_Это займет около 15–20 секунд._")
+
+    u = get_user(uid)
+    diet_json = await generate_weekly_diet_json(u, u["diet_start_date"])
+    if not diet_json or "days" not in diet_json:
+        await safe_edit(callback.message, "⚠️ Сервер ИИ временно перегружен. Нажмите кнопку ниже, чтобы повторить генерацию:",
+                        InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Повторить", callback_data="regen_full_diet")]]))
+        return
+
+    update_user(
+        uid,
+        current_diet_json=json.dumps(diet_json, ensure_ascii=False),
+        recipes_cache_json="{}",
+        shopping_list_cache=None,
+        last_month_check=get_msk_now().strftime("%Y-%m-%d")
+    )
+
+    text, kb = render_diet_day(uid, 0)
+    await safe_edit(callback.message, text, kb)
+
+    # Предлагаем вторую функцию (Продуктовый контроль) ровно 1 раз, если она еще не задействована
+    u = get_user(uid)
+    prods = get_products_db(uid)
+    if not prods and not u.get("offered_fridge"):
+        update_user(uid, offered_fridge=1)
+        offer_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📦 Попробовать Контроль продуктов", callback_data="switch_to_fridge")]
+        ])
+        await bot.send_message(
+            callback.message.chat.id,
+            "💡 **Кстати!** У меня есть вторая удобная функция — **«📦 Продуктовый контроль»**.\n"
+            "Вы можете заносить туда купленные продукты со сроками годности, и я заранее предупрежу вас, прежде чем что-то испортится в холодильнике!",
+            parse_mode="Markdown",
+            reply_markup=offer_kb
+        )
+
+# Защита от ответов не по плану во время анкеты
+@router.message(OnboardingSG.bju_choice)
+@router.message(OnboardingSG.exp_level)
+@router.message(OnboardingSG.goal)
+@router.message(OnboardingSG.high_weight_confirm)
+@router.message(OnboardingSG.has_supplements)
+@router.message(OnboardingSG.meals_ready_choice)
+@router.message(OnboardingSG.meals_count_input)
+@router.message(OnboardingSG.sport_nutr_choice)
+async def fallback_onboarding_buttons_only(message: Message):
+    await try_delete_user_msg(message)
+    warn = await message.answer("⚠️ Ответьте на предыдущий вопрос! Бот ждет вашего ответа по плану (нажмите на одну из кнопок выше).")
+    await asyncio.sleep(3.5)
+    try:
+        await warn.delete()
+    except Exception:
+        pass
+
+# ==========================================
+# ОТОБРАЖЕНИЕ РАЦИОНА, РЕЦЕПТОВ, ЗАМЕН И СПИСКА ПОКУПОК
+# ==========================================
+def render_diet_day(uid: int, day_idx: int):
+    u = get_user(uid)
+    diet = json.loads(u["current_diet_json"])
+    days = diet.get("days", [])
+    if day_idx >= len(days):
+        day_idx = 0
+    d_obj = days[day_idx]
+
+    # Вычисляем реальные даты со следующего дня (или от даты старта рациона)
+    try:
+        if u["diet_start_date"]:
+            start_dt = datetime.strptime(u["diet_start_date"], "%Y-%m-%d")
+        else:
+            start_dt = get_msk_now() + timedelta(days=1)
+    except Exception:
+        start_dt = get_msk_now() + timedelta(days=1)
+
+    real_full_date = (start_dt + timedelta(days=day_idx)).strftime("%d.%m")
+    meals = d_obj.get("meals", [])
+
+    text = (
+        f"🥗 **Рацион на {real_full_date}**\n"
+        f"🎯 Дневная цель: **Б:** {u['target_p']}г | **Ж:** {u['target_f']}г | **У:** {u['target_c']}г\n"
+    )
+    if u["expert_note"]:
+        text += f"💬 _{u['expert_note']}_\n"
+    text += "━━━━━━━━━━━━━━━\n\n"
+
+    kb = []
+    for m_idx, m in enumerate(meals):
+        text += (
+            f"🍽 **{m['num']}. {m['title']}**\n"
+            f"⚖️ Порция: {m['weight']}\n"
+            f"📊 Б: {m['p']}г | Ж: {m['f']}г | У: {m['c']}г\n\n"
+        )
+        kb.append([
+            InlineKeyboardButton(text=f"📖 Рецепт #{m['num']}", callback_data=f"recipe_{day_idx}_{m_idx}"),
+            InlineKeyboardButton(text=f"🔄 Заменить #{m['num']}", callback_data=f"repmeal_{day_idx}_{m_idx}")
+        ])
+
+    # Кнопки внизу — строго числа месяца (например 14, 15, 16...) в соответствии с рационом
+    day_btns = []
+    for i in range(len(days)):
+        day_num_only = (start_dt + timedelta(days=i)).strftime("%d")
+        mark = f"• {day_num_only} •" if i == day_idx else day_num_only
+        day_btns.append(InlineKeyboardButton(text=mark, callback_data=f"viewday_{i}"))
+
+    kb.append(day_btns[:4])
+    if len(day_btns) > 4:
+        kb.append(day_btns[4:])
+
+    kb.append([
+        InlineKeyboardButton(text=f"🔄 Заменить {real_full_date}", callback_data=f"repday_{day_idx}"),
+        InlineKeyboardButton(text="🔄 Заменить весь рацион", callback_data="regen_full_diet")
+    ])
+    kb.append([
+        InlineKeyboardButton(text="🚫 Убрать блюдо", callback_data="remove_specific_dish"),
+        InlineKeyboardButton(text="🛒 Список продуктов к покупке", callback_data="view_shopping_list")
+    ])
+    kb.append([
+        InlineKeyboardButton(text="🥑 Вписать купленный продукт", callback_data="insert_bought_prod"),
+        InlineKeyboardButton(text="⏭ Рацион на след. неделю", callback_data="gen_next_week")
+    ])
+    kb.append([InlineKeyboardButton(text="📦 Контроль продуктов", callback_data="switch_to_fridge")])
+    kb.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_modes")])
+
+    return text, InlineKeyboardMarkup(inline_keyboard=kb)
+
+@router.callback_query(F.data.startswith("viewday_"))
+async def cb_view_day(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    day_idx = int(callback.data.split("_")[1])
+    text, kb = render_diet_day(callback.from_user.id, day_idx)
+    await safe_edit(callback.message, text, kb)
 
 @router.callback_query(F.data.startswith("recipe_"))
-async def cb_open_recipe(call: CallbackQuery):
-    _, week_type, day_str, meal_str = call.data.split("_")
-    day_num, meal_num = int(day_str), int(meal_str)
-    user = get_user(call.from_user.id)
+async def cb_show_recipe(callback: CallbackQuery):
+    _, d_idx, m_idx = callback.data.split("_")
+    d_idx, m_idx = int(d_idx), int(m_idx)
+    uid = callback.from_user.id
+    u = get_user(uid)
+    diet = json.loads(u["current_diet_json"])
+    meal = diet["days"][d_idx]["meals"][m_idx]
+    cache = json.loads(u["recipes_cache_json"] or "{}")
+    cache_key = f"{d_idx}_{m_idx}_{meal['title']}"
 
-    json_field = "current_diet_json" if week_type == "curr" else "next_diet_json"
-    diet_data = json.loads(user.get(json_field) or user["current_diet_json"])
-    day_obj = next((d for d in diet_data["days"] if int(d["day_num"]) == day_num), diet_data["days"][0])
-    meal_obj = next((m for m in day_obj["meals"] if int(m["meal_num"]) == meal_num), day_obj["meals"][0])
+    if cache_key not in cache:
+        await safe_edit(callback.message, f"👨‍🍳 **Готовлю подробный пошаговый рецепт для:**\n_{meal['title']}_...")
+        prompt = (
+            f"Напиши простой, понятный и подробный пошаговый рецепт приготовления блюда:\n"
+            f"Блюдо: {meal['title']}\n"
+            f"Ингредиенты: {meal.get('short_ingredients', meal['title'])}\n"
+            f"Вес порции: {meal['weight']} (Б: {meal['p']}г, Ж: {meal['f']}г, У: {meal['c']}г).\n"
+            f"Распиши точные граммовки и шаги приготовления без воды."
+        )
+        rec_text = await ask_ai(prompt, temperature=0.3)
+        cache[cache_key] = rec_text
+        update_user(uid, recipes_cache_json=json.dumps(cache, ensure_ascii=False))
+    else:
+        rec_text = cache[cache_key]
 
-    await call.message.edit_text(f"⏳ <b>Открываю подробный рецепт блюда «{meal_obj['dish_name']}»...</b>")
-    recipe_text = await asyncio.to_thread(
-        get_detailed_recipe, call.from_user.id, meal_obj["dish_name"], meal_obj["ingredients"]
-    )
-
-    b = InlineKeyboardBuilder()
-    b.button(text="🔙 Вернуться обратно", callback_data=f"view_day_{day_num}_{week_type}")
-
-    full_text = (
-        f"🍽 <b>{meal_obj['dish_name']} ({day_obj['day_name']})</b>\n"
-        f"<i>БЖУ порции: Белки {meal_obj['p']}г | Жиры {meal_obj['f']}г | Углеводы {meal_obj['c']}г</i>\n\n"
-        f"{recipe_text}"
-    )
-    await call.message.edit_text(full_text, reply_markup=b.as_markup())
-
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Вернуться обратно", callback_data=f"viewday_{d_idx}")]
+    ])
+    await safe_edit(callback.message, f"📖 **Рецепт: {meal['title']}**\n\n{rec_text}", kb)
 
 @router.callback_query(F.data.startswith("repmeal_"))
-async def cb_replace_single_meal(call: CallbackQuery):
-    _, week_type, day_str, meal_str = call.data.split("_")
-    day_num, meal_num = int(day_str), int(meal_str)
-    user = get_user(call.from_user.id)
-    json_field = "current_diet_json" if week_type == "curr" else "next_diet_json"
-    diet_data = json.loads(user.get(json_field))
+async def cb_replace_meal(callback: CallbackQuery):
+    _, d_idx, m_idx = callback.data.split("_")
+    d_idx, m_idx = int(d_idx), int(m_idx)
+    uid = callback.from_user.id
+    u = get_user(uid)
+    diet = json.loads(u["current_diet_json"])
+    old_meal = diet["days"][d_idx]["meals"][m_idx]
 
-    day_obj = next((d for d in diet_data["days"] if int(d["day_num"]) == day_num), diet_data["days"][0])
-    meal_obj = next((m for m in day_obj["meals"] if int(m["meal_num"]) == meal_num), day_obj["meals"][0])
-    old_dish = meal_obj["dish_name"]
+    await safe_edit(callback.message, f"🔄 **Подбираю простую и доступную замену вместо:**\n_{old_meal['title']}_...")
+    prompt = f"""Замени этот прием пищи на другой из простых базовых продуктов (магазины: {u['stores']}, аллергии: {u['allergies']}).
+Старое блюдо (НЕ ПОВТОРЯТЬ): {old_meal['title']}
+Нужное БЖУ этого приема пищи: Белки ~{old_meal['p']}г, Жиры ~{old_meal['f']}г, Углеводы ~{old_meal['c']}г.
+Никаких дорогих или редких ингредиентов!
+Верни СТРОГО JSON одного приема пищи:
+{{"num": {old_meal['num']}, "title": "...", "weight": "...", "p": {old_meal['p']}, "f": {old_meal['f']}, "c": {old_meal['c']}, "short_ingredients": "..."}}"""
 
-    await call.message.edit_text(f"⏳ <b>Подбираю простую и практичную замену для блюда «{old_dish}»...</b>")
-
-    sys_p = "Ты спортивный диетолог. Предложи ОДНО простое, доступное блюдо на замену строго в формате JSON."
-    usr_p = (
-        f"Замени блюдо '{old_dish}' на другое простое из магазинов ({user['stores']}). "
-        f"Аллергии: {user['allergies']}. Целевое БЖУ приема: Б:{meal_obj['p']} Ж:{meal_obj['f']} У:{meal_obj['c']}. "
-        'Верни строго JSON: {"dish_name": "Название", "ingredients": "Ингредиенты с граммами"}'
-    )
-    raw = await asyncio.to_thread(giga.ask, sys_p, usr_p, 0.7)
+    res = await ask_ai(prompt, system="Отвечай строго валидным JSON.", temperature=0.5)
     try:
-        m_json = json.loads(re.search(r"\{.*\}", raw, re.DOTALL).group(0))
-        meal_obj["dish_name"] = m_json.get("dish_name", "Индейка с рисом и овощами")
-        meal_obj["ingredients"] = m_json.get("ingredients", "Филе индейки 130г, рис 60г, огурец 100г")
+        new_meal = json.loads(clean_json_str(res))
+        diet["days"][d_idx]["meals"][m_idx] = new_meal
+        update_user(uid, current_diet_json=json.dumps(diet, ensure_ascii=False), shopping_list_cache=None)
     except Exception:
-        meal_obj["dish_name"] = "Куриное филе с гречкой и свежим огурцом"
-        meal_obj["ingredients"] = "Куриное филе 130г, гречка 60г, огурец 100г"
+        pass
 
-    save_user_field(call.from_user.id, **{json_field: json.dumps(diet_data, ensure_ascii=False)}, shopping_list_cache="")
-    text, kb = format_day_text_and_kb(diet_data, day_num, week_type)
-    await call.message.edit_text(text, reply_markup=kb)
-
+    text, kb = render_diet_day(uid, d_idx)
+    await safe_edit(callback.message, text, kb)
 
 @router.callback_query(F.data.startswith("repday_"))
-async def cb_replace_day(call: CallbackQuery):
-    _, week_type, day_str = call.data.split("_")
-    day_num = int(day_str)
-    user = get_user(call.from_user.id)
-    json_field = "current_diet_json" if week_type == "curr" else "next_diet_json"
-    diet_data = json.loads(user.get(json_field))
+async def cb_replace_day(callback: CallbackQuery):
+    d_idx = int(callback.data.split("_")[1])
+    uid = callback.from_user.id
+    u = get_user(uid)
+    diet = json.loads(u["current_diet_json"])
+    day_date = diet["days"][d_idx]["date"]
 
-    await call.message.edit_text("⏳ <b>Обновляю меню на выбранный день...</b>")
-    new_week = await asyncio.to_thread(generate_weekly_diet_ai, user, (week_type == "next"), None)
-    new_day = next((d for d in new_week["days"] if int(d["day_num"]) == day_num), new_week["days"][0])
+    await safe_edit(callback.message, f"🔄 **Полностью обновляю меню на {day_date}...**")
+    prompt = f"""Составь новое меню на 1 день ({day_date}) из простых базовых продуктов (магазины: {u['stores']}, аллергии: {u['allergies']}).
+Дневная цель БЖУ: Белки {u['target_p']}г, Жиры {u['target_f']}г, Углеводы {u['target_c']}г.
+Количество приемов пищи: {u['actual_meals']}.
+Никаких уток, форели и дорогих стейков — только простые повседневные блюда.
+Верни СТРОГО JSON объекта дня:
+{{"date": "{day_date}", "meals": [{{"num": 1, "title": "...", "weight": "...", "p": 30, "f": 15, "c": 50, "short_ingredients": "..."}}]}}"""
 
-    for idx, d in enumerate(diet_data["days"]):
-        if int(d["day_num"]) == day_num:
-            new_day["day_name"] = d["day_name"]
-            diet_data["days"][idx] = new_day
-            break
+    res = await ask_ai(prompt, system="Отвечай строго валидным JSON.", temperature=0.5)
+    try:
+        new_day = json.loads(clean_json_str(res))
+        if "meals" in new_day:
+            diet["days"][d_idx] = new_day
+            update_user(uid, current_diet_json=json.dumps(diet, ensure_ascii=False), shopping_list_cache=None)
+    except Exception:
+        pass
 
-    save_user_field(call.from_user.id, **{json_field: json.dumps(diet_data, ensure_ascii=False)}, shopping_list_cache="")
-    text, kb = format_day_text_and_kb(diet_data, day_num, week_type)
-    await call.message.edit_text(text, reply_markup=kb)
-
-
-# Подменю изменения рациона/блюда и параметров (чтобы не засорять главный экран лишними кнопками)
-@router.callback_query(F.data == "open_diet_edit_menu")
-async def cb_open_diet_edit_menu(call: CallbackQuery):
-    b = InlineKeyboardBuilder()
-    b.button(text="🔄 Полностью поменять весь рацион", callback_data="regen_full_diet")
-    b.button(text="🚫 Убрать конкретное блюдо", callback_data="remove_specific_dish")
-    b.button(text="🥑 Вписать купленный продукт", callback_data="insert_bought_prod")
-    b.button(text="🔙 Назад к рациону", callback_data="view_week_summary")
-    b.adjust(1)
-    await call.message.edit_text("🔄 <b>Управление вашим рационом:</b>\nВыберите действие:", reply_markup=b.as_markup())
-
-
-@router.callback_query(F.data == "open_profile_edit_menu")
-async def cb_open_profile_edit_menu(call: CallbackQuery):
-    user = get_user(call.from_user.id)
-    b = InlineKeyboardBuilder()
-    b.button(text="⚖️ Изменить вес", callback_data="edit_param_weight")
-    b.button(text="🍽 Изменить кол-во приемов пищи", callback_data="edit_param_meals")
-    b.button(text="💰 Изменить бюджет", callback_data="edit_param_budget")
-    b.button(text="💊 Добавить спорт. добавки", callback_data="edit_param_supps")
-    b.button(text="📝 Заполнить анкету заново", callback_data="restart_questionnaire")
-    b.button(text="🔙 Назад к рациону", callback_data="view_week_summary")
-    b.adjust(2, 2, 1, 1)
-    await call.message.edit_text(
-        f"⚙️ <b>Ваши текущие параметры:</b>\n"
-        f"• Вес: <b>{user.get('weight')} кг</b> | Приемов пищи: <b>{user.get('actual_meals')}</b>\n"
-        f"• Бюджет: <b>{user.get('budget')}</b> | Магазины: <b>{user.get('stores')}</b>\n\n"
-        "Что вы хотите изменить?",
-        reply_markup=b.as_markup(),
-    )
-
+    text, kb = render_diet_day(uid, d_idx)
+    await safe_edit(callback.message, text, kb)
 
 @router.callback_query(F.data == "regen_full_diet")
-async def cb_regen_full_diet(call: CallbackQuery):
-    user = get_user(call.from_user.id)
-    await call.message.edit_text("⏳ <b>Полностью меняю ваш рацион с сохранением всех ваших показателей БЖУ...</b>")
-    new_diet = await asyncio.to_thread(generate_weekly_diet_ai, user, False, None)
-    save_user_field(call.from_user.id, current_diet_json=json.dumps(new_diet, ensure_ascii=False), shopping_list_cache="")
-    user = get_user(call.from_user.id)
-    text = format_weekly_summary_text(user, new_diet, is_next=False)
-    await call.message.edit_text(text, reply_markup=kb_main_app_menu(user, new_diet))
-
-
-@router.callback_query(F.data == "gen_next_week")
-async def cb_gen_next_week(call: CallbackQuery):
-    user = get_user(call.from_user.id)
-    if user.get("next_diet_json"):
-        await cb_view_next_week(call)
-        return
-    await call.message.edit_text("⏳ <b>Формирую рацион на следующую неделю (максимум на 1 неделю вперед)...</b>")
-    next_diet = await asyncio.to_thread(generate_weekly_diet_ai, user, True, None)
-    save_user_field(call.from_user.id, next_diet_json=json.dumps(next_diet, ensure_ascii=False))
-    await show_next_week_view(call.message, user, next_diet)
-
-
-@router.callback_query(F.data == "view_next_week")
-async def cb_view_next_week(call: CallbackQuery):
-    user = get_user(call.from_user.id)
-    if not user.get("next_diet_json"):
-        await cb_gen_next_week(call)
-        return
-    next_diet = json.loads(user["next_diet_json"])
-    await show_next_week_view(call.message, user, next_diet)
-
-
-async def show_next_week_view(message: Message, user: dict, next_diet: dict):
-    text = format_weekly_summary_text(user, next_diet, is_next=True) + "\n\n<b>Устраивает ли вас этот рацион на следующую неделю?</b>"
-    b = InlineKeyboardBuilder()
-    for d in next_diet.get("days", []):
-        d_num = d.get("day_num", 1)
-        d_label = d.get("day_name", f"День {d_num}")
-        b.button(text=f"{d_label}", callback_data=f"view_day_{d_num}_next")
-    b.button(text="✅ Да, устраивает", callback_data="next_week_approve")
-    b.button(text="🔄 Поменять", callback_data="next_week_regen")
-    b.button(text="🔙 Назад к текущей неделе", callback_data="view_week_summary")
-    b.adjust(4, 3, 2, 1)
-    await message.edit_text(text, reply_markup=b.as_markup())
-
-
-@router.callback_query(F.data == "next_week_approve")
-async def cb_next_week_approve(call: CallbackQuery, state: FSMContext):
-    await call.answer("✅ Отлично! Рацион на следующую неделю сохранен.", show_alert=True)
-    await cb_view_week_summary(call, state)
-
-
-@router.callback_query(F.data == "next_week_regen")
-async def cb_next_week_regen(call: CallbackQuery):
-    user = get_user(call.from_user.id)
-    await call.message.edit_text("⏳ <b>Меняю рацион на следующую неделю...</b>")
-    next_diet = await asyncio.to_thread(generate_weekly_diet_ai, user, True, None)
-    save_user_field(call.from_user.id, next_diet_json=json.dumps(next_diet, ensure_ascii=False))
-    await show_next_week_view(call.message, user, next_diet)
-
-
-# ==========================================
-# 8. ИЗМЕНЕНИЕ ПАРАМЕТРОВ ПОЛЬЗОВАТЕЛЯ
-# ==========================================
-@router.callback_query(F.data == "edit_param_weight")
-async def cb_edit_weight(call: CallbackQuery, state: FSMContext):
-    await state.set_state(EditProfileSG.edit_weight)
-    await call.message.edit_text("Введите ваш новый вес (в кг):", reply_markup=kb_back_only("open_profile_edit_menu"))
-
-
-@router.message(EditProfileSG.edit_weight)
-async def msg_edit_weight(message: Message, state: FSMContext):
-    try:
-        w = float(message.text.replace(",", ".").strip())
-        if not (30 <= w <= 250):
-            raise ValueError()
-    except Exception:
-        await message.answer("⚠️ Введите корректный вес числом:", reply_markup=kb_back_only("open_profile_edit_menu"))
-        return
-    user_id = message.from_user.id
-    save_user_field(user_id, weight=w)
-    user = get_user(user_id)
-    macros = await asyncio.to_thread(calculate_macros, user)
-    save_user_field(user_id, target_p=macros["p"], target_f=macros["f"], target_c=macros["c"], rec_meals=macros["rec_meals"])
-    await state.clear()
-
-    wait_msg = await message.answer("⏳ Вес обновлен! Пересчитываю БЖУ и рацион...")
-    user = get_user(user_id)
-    new_diet = await asyncio.to_thread(generate_weekly_diet_ai, user, False, None)
-    save_user_field(user_id, current_diet_json=json.dumps(new_diet, ensure_ascii=False), shopping_list_cache="")
-    await wait_msg.edit_text(format_weekly_summary_text(user, new_diet), reply_markup=kb_main_app_menu(user, new_diet))
-
-
-@router.callback_query(F.data == "edit_param_meals")
-async def cb_edit_meals(call: CallbackQuery, state: FSMContext):
-    await state.set_state(EditProfileSG.edit_meals)
-    await call.message.edit_text("Введите новое количество приемов пищи в день (от 1 до 5):", reply_markup=kb_back_only("open_profile_edit_menu"))
-
-
-@router.message(EditProfileSG.edit_meals)
-async def msg_edit_meals(message: Message, state: FSMContext):
-    if not (message.text and message.text.strip().isdigit() and 1 <= int(message.text.strip()) <= 5):
-        await message.answer("⚠️ Введите число от 1 до 5:", reply_markup=kb_back_only("open_profile_edit_menu"))
-        return
-    user_id = message.from_user.id
-    save_user_field(user_id, actual_meals=int(message.text.strip()))
-    await state.clear()
-    wait_msg = await message.answer("⏳ Количество приемов пищи изменено! Перестраиваю рацион...")
-    user = get_user(user_id)
-    new_diet = await asyncio.to_thread(generate_weekly_diet_ai, user, False, None)
-    save_user_field(user_id, current_diet_json=json.dumps(new_diet, ensure_ascii=False), shopping_list_cache="")
-    await wait_msg.edit_text(format_weekly_summary_text(user, new_diet), reply_markup=kb_main_app_menu(user, new_diet))
-
-
-@router.callback_query(F.data == "edit_param_budget")
-async def cb_edit_budget(call: CallbackQuery, state: FSMContext):
-    await state.set_state(EditProfileSG.edit_budget)
-    await call.message.edit_text("Введите новый бюджет на неделю (в рублях):", reply_markup=kb_back_only("open_profile_edit_menu"))
-
-
-@router.message(EditProfileSG.edit_budget)
-async def msg_edit_budget(message: Message, state: FSMContext):
-    user_id = message.from_user.id
-    save_user_field(user_id, budget=message.text.strip())
-    await state.clear()
-    wait_msg = await message.answer("⏳ Бюджет обновлен! Перестраиваю рацион...")
-    user = get_user(user_id)
-    new_diet = await asyncio.to_thread(generate_weekly_diet_ai, user, False, None)
-    save_user_field(user_id, current_diet_json=json.dumps(new_diet, ensure_ascii=False), shopping_list_cache="")
-    await wait_msg.edit_text(format_weekly_summary_text(user, new_diet), reply_markup=kb_main_app_menu(user, new_diet))
-
-
-@router.callback_query(F.data == "edit_param_supps")
-async def cb_edit_supps(call: CallbackQuery, state: FSMContext):
-    await state.set_state(EditProfileSG.add_supp_name)
-    await call.message.edit_text(
-        "Введите название спортивной добавки (и при желании БЖУ порции в скобках), которую хотите добавить:",
-        reply_markup=kb_back_only("open_profile_edit_menu"),
-    )
-
-
-@router.message(EditProfileSG.add_supp_name)
-async def msg_add_supp_name(message: Message, state: FSMContext):
-    await state.update_data(new_supp_name=message.text.strip())
-    await state.set_state(EditProfileSG.add_supp_freq)
-    await message.answer(
-        f"Укажите периодичность приема для <b>«{message.text.strip()}»</b>:",
-        reply_markup=kb_back_only("open_profile_edit_menu"),
-    )
-
-
-@router.message(EditProfileSG.add_supp_freq)
-async def msg_add_supp_freq(message: Message, state: FSMContext):
-    data = await state.get_data()
-    supp_name = data["new_supp_name"]
-    user_id = message.from_user.id
-    user = get_user(user_id)
-    supps = json.loads(user.get("supplements_json") or "{}")
-    supps[supp_name] = message.text.strip()
-    save_user_field(user_id, has_supplements=1, use_sport_nutr=1, supplements_json=json.dumps(supps, ensure_ascii=False))
-    await state.clear()
-
-    wait_msg = await message.answer("⏳ Добавка включена в план! Обновляю рацион...")
-    user = get_user(user_id)
-    new_diet = await asyncio.to_thread(generate_weekly_diet_ai, user, False, None)
-    save_user_field(user_id, current_diet_json=json.dumps(new_diet, ensure_ascii=False), shopping_list_cache="")
-    await wait_msg.edit_text(format_weekly_summary_text(user, new_diet), reply_markup=kb_main_app_menu(user, new_diet))
-
+async def cb_regen_full_diet(callback: CallbackQuery):
+    uid = callback.from_user.id
+    u = get_user(uid)
+    await safe_edit(callback.message, "🔄 **Составляю полностью новый рацион на 7 дней...**\n_Подождите 15–20 секунд._")
+    start_dt = u["diet_start_date"] or (get_msk_now() + timedelta(days=1)).strftime("%Y-%m-%d")
+    new_diet = await generate_weekly_diet_json(u, start_dt)
+    if new_diet and "days" in new_diet:
+        update_user(uid, current_diet_json=json.dumps(new_diet, ensure_ascii=False), recipes_cache_json="{}", shopping_list_cache=None)
+    text, kb = render_diet_day(uid, 0)
+    await safe_edit(callback.message, text, kb)
 
 @router.callback_query(F.data == "remove_specific_dish")
-async def cb_remove_specific_dish(call: CallbackQuery, state: FSMContext):
-    await state.set_state(EditProfileSG.exclude_dish_name)
-    await call.message.edit_text(
-        "Напишите название блюда, которое нужно убрать и заменить в рационе:",
-        reply_markup=kb_back_only("open_diet_edit_menu"),
+async def cb_remove_dish_prompt(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(DietReplaceSG.removing_dish)
+    await state.update_data(prompt_mid=callback.message.message_id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Вернуться обратно", callback_data="viewday_0")]])
+    await safe_edit(
+        callback.message,
+        "🚫 Напишите название блюда или продукта, который вам не нравится (я уберу его из рациона и заменю на другое доступное блюдо):",
+        kb
     )
 
-
-@router.message(EditProfileSG.exclude_dish_name)
-async def msg_remove_specific_dish(message: Message, state: FSMContext):
-    dish_to_remove = message.text.strip()
-    user_id = message.from_user.id
+@router.message(DietReplaceSG.removing_dish)
+async def process_remove_dish(message: Message, state: FSMContext):
+    dish = (message.text or "").strip()
+    data = await state.get_data()
+    prompt_mid = data.get("prompt_mid")
+    await try_delete_user_msg(message)
     await state.clear()
-    wait_msg = await message.answer(f"⏳ Убираю блюдо «{dish_to_remove}» и обновляю рацион...")
-    user = get_user(user_id)
-    new_diet = await asyncio.to_thread(generate_weekly_diet_ai, user, False, dish_to_remove)
-    save_user_field(user_id, current_diet_json=json.dumps(new_diet, ensure_ascii=False), shopping_list_cache="")
-    await wait_msg.edit_text(format_weekly_summary_text(user, new_diet), reply_markup=kb_main_app_menu(user, new_diet))
 
+    uid = message.from_user.id
+    u = get_user(uid)
+    await bot.edit_message_text(f"🔄 Убираю **{dish}** и перестраиваю ваш рацион...", chat_id=message.chat.id, message_id=prompt_mid, parse_mode="Markdown")
+    new_diet = await generate_weekly_diet_json(u, u["diet_start_date"], forbidden_dish=dish)
+    if new_diet and "days" in new_diet:
+        update_user(uid, current_diet_json=json.dumps(new_diet, ensure_ascii=False), shopping_list_cache=None)
+    text, kb = render_diet_day(uid, 0)
+    await bot.edit_message_text(text, chat_id=message.chat.id, message_id=prompt_mid, parse_mode="Markdown", reply_markup=kb)
+
+@router.callback_query(F.data == "view_shopping_list")
+async def cb_view_shopping_list(callback: CallbackQuery):
+    uid = callback.from_user.id
+    u = get_user(uid)
+    if not u.get("shopping_list_cache"):
+        await safe_edit(callback.message, f"🛒 **Составляю список продуктов и проверяю цены в магазинах ({u['stores']})...**")
+        diet = json.loads(u["current_diet_json"])
+        shop_text = await generate_shopping_list_ai(u, diet)
+        update_user(uid, shopping_list_cache=shop_text)
+    else:
+        shop_text = u["shopping_list_cache"]
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Пересчитать корзину", callback_data="refresh_shopping_list")],
+        [InlineKeyboardButton(text="🔙 Вернуться к рациону", callback_data="viewday_0")]
+    ])
+    await safe_edit(callback.message, f"🛒 **Список продуктов к покупке на неделю**\n\n{shop_text}", kb)
+
+@router.callback_query(F.data == "refresh_shopping_list")
+async def cb_refresh_shopping_list(callback: CallbackQuery):
+    update_user(callback.from_user.id, shopping_list_cache=None)
+    await cb_view_shopping_list(callback)
+
+@router.callback_query(F.data == "gen_next_week")
+async def cb_gen_next_week(callback: CallbackQuery):
+    uid = callback.from_user.id
+    u = get_user(uid)
+    await safe_edit(callback.message, "⏭ **Формирую новый рацион на следующую неделю (на 7 дней вперед)...**")
+    next_start = (get_msk_now() + timedelta(days=7)).strftime("%Y-%m-%d")
+    next_diet = await generate_weekly_diet_json(u, next_start)
+    if next_diet and "days" in next_diet:
+        update_user(uid, current_diet_json=json.dumps(next_diet, ensure_ascii=False), diet_start_date=next_start, shopping_list_cache=None)
+    text, kb = render_diet_day(uid, 0)
+    await safe_edit(callback.message, text, kb)
 
 # ==========================================
-# 9. ФУНКЦИЯ 2: ПРОДУКТОВЫЙ КОНТРОЛЬ (С ЧИСТОЙ НАВИГАЦИЕЙ)
+# ВПИСАТЬ КУПЛЕННЫЙ ПРОДУКТ В РАЦИОН
 # ==========================================
-def kb_fridge_dashboard(has_diet: bool) -> InlineKeyboardMarkup:
-    """Внутри Контроля продуктов свои кнопки управления + ОДНА кнопка перехода в Рацион."""
-    b = InlineKeyboardBuilder()
-    b.button(text="➕ Добавить продукт", callback_data="fridge_add_start")
-    b.button(text="🗑 Убрать продукт", callback_data="fridge_del_menu")
-    if has_diet:
-        b.button(text="🥑 Вписать продукт в рацион", callback_data="insert_bought_prod")
-        b.button(text="🥗 Перейти в Рацион", callback_data="view_week_summary")
-    else:
-        b.button(text="🥗 Рацион", callback_data="mode_diet")
-    b.button(text="🔙 Назад в главное меню", callback_data="back_to_start_modes")
-    b.adjust(2, 1, 1, 1)
-    return b.as_markup()
-
-
-def format_fridge_list(user_id: int) -> str:
-    prods = get_products_db(user_id)
-    if not prods:
-        return "📦 <b>Продуктовый контроль</b>\n\nСписок ваших продуктов пока пуст. Нажмите «➕ Добавить продукт», чтобы начать отслеживание сроков годности."
-
-    today = datetime.now(MSK_TZ).date()
-    lines = ["📦 <b>Продуктовый контроль (Ваши продукты):</b>\n"]
-    for p in prods:
-        try:
-            exp_d = datetime.strptime(p["exp_date"], "%d.%m.%Y").date()
-            days_left = (exp_d - today).days
-            if days_left < 0:
-                status = f"❌ <b>СТУХ! ({p['exp_date']})</b>"
-            elif days_left == 0:
-                status = f"⚠️ Истекает сегодня ({p['exp_date']})"
-            elif days_left == 1:
-                status = f"⏳ Стухнет завтра (до {p['exp_date']})"
-            elif days_left <= 5:
-                status = f"⚠️ Стухнет через {days_left} дн. (до {p['exp_date']})"
-            else:
-                status = f"✅ Годен до {p['exp_date']} ({days_left} дн.)"
-        except Exception:
-            status = f"до {p['exp_date']}"
-        lines.append(f"• <b>{p['name']}</b> — {status}")
-    return "\n".join(lines)
-
-
-@router.callback_query(F.data == "mode_fridge")
-async def start_fridge_from_main(call: CallbackQuery, state: FSMContext):
-    await state.clear()
-    prods = get_products_db(call.from_user.id)
-    if prods:
-        await open_fridge_dashboard(call, state)
-    else:
-        await state.set_state(FridgeSG.entering_product)
-        await call.message.edit_text(
-            "📦 <b>Продуктовый контроль</b>\n\n"
-            "Введите название продукта и срок годности до какого числа\n"
-            "<i>(например: <code>Сыр пармезан 12.02.2027</code>)</i>:",
-            reply_markup=kb_back_only("back_to_start_modes"),
-        )
-
-
-@router.callback_query(F.data == "fridge_add_start")
-async def start_fridge_add(call: CallbackQuery, state: FSMContext):
-    await state.set_state(FridgeSG.entering_product)
-    await call.message.edit_text(
-        "Введите название продукта и срок годности до какого числа\n"
-        "<i>(например: <code>Сыр пармезан 12.02.2027</code>)</i>:",
-        reply_markup=kb_back_only("open_fridge_app"),
+@router.callback_query(F.data == "insert_bought_prod")
+async def cb_insert_bought_prod(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(ProductSG.waiting_bought_product)
+    await state.update_data(prompt_mid=callback.message.message_id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Вернуться обратно", callback_data="viewday_0")]])
+    await safe_edit(
+        callback.message,
+        "🥑 **Вписать купленный продукт в рацион**\n\n"
+        "Напишите, какой продукт вы купили и его вес/количество (например: `Творог 5% 400г` или `Стейк индейки 500г`).\n"
+        "ИИ-тренер посчитает его БЖУ и аккуратно впишет его в ваш текущий рацион:",
+        kb
     )
 
-
-@router.callback_query(F.data == "open_fridge_app")
-async def open_fridge_dashboard(call: CallbackQuery, state: FSMContext):
+@router.message(ProductSG.waiting_bought_product)
+async def process_insert_bought_prod(message: Message, state: FSMContext):
+    prod_txt = (message.text or "").strip()
+    data = await state.get_data()
+    prompt_mid = data.get("prompt_mid")
+    await try_delete_user_msg(message)
     await state.clear()
-    user = get_user(call.from_user.id)
-    has_diet = bool(user and user.get("current_diet_json"))
-    await call.message.edit_text(format_fridge_list(call.from_user.id), reply_markup=kb_fridge_dashboard(has_diet))
 
-
-@router.message(FridgeSG.entering_product)
-async def process_fridge_product_input(message: Message, state: FSMContext):
-    txt = (message.text or "").strip()
-    match = re.search(r"(\d{2}\.\d{2}\.\d{4})$", txt)
-    if not match:
-        await message.answer(
-            "⚠️ Укажите название и дату окончания срока годности в формате ДД.ММ.ГГГГ "
-            "(например: <code>Сыр пармезан 12.02.2027</code>):",
-            reply_markup=kb_back_only("open_fridge_app"),
+    uid = message.from_user.id
+    u = get_user(uid)
+    if not u.get("current_diet_json"):
+        await bot.edit_message_text(
+            "⚠️ У вас еще не создан рацион! Перейдите в режим «🥗 Рацион», чтобы составить меню.",
+            chat_id=message.chat.id, message_id=prompt_mid,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🥗 Создать рацион", callback_data="mode_diet")]])
         )
         return
 
-    date_str = match.group(1)
-    name_str = txt[: match.start()].strip()
-    if not name_str:
-        await message.answer("⚠️ Вы не указали название продукта перед датой!", reply_markup=kb_back_only("open_fridge_app"))
-        return
+    await bot.edit_message_text(f"⏳ Считаю БЖУ продукта **{prod_txt}** и вписываю его в ваш рацион...", chat_id=message.chat.id, message_id=prompt_mid, parse_mode="Markdown")
+    diet = json.loads(u["current_diet_json"])
+    prompt = f"""Пользователь дополнительно купил продукт: "{prod_txt}".
+Его целевое дневное БЖУ: Белки {u['target_p']}г, Жиры {u['target_f']}г, Углеводы {u['target_c']}г.
+Текущий рацион: {json.dumps(diet, ensure_ascii=False)}
 
+1. Посчитай БЖУ купленного продукта.
+2. Впиши его в ближайшие дни рациона (заменив или скорректировав подходящие приемы пищи так, чтобы дневная норма БЖУ не нарушилась).
+Верни СТРОГО JSON формата:
+{{
+  "trainer_comment": "Краткий совет тренера: сколько БЖУ в продукте и в какие дни/приемы пищи он был вписан",
+  "updated_diet": {{ ...полный обновленный объект рациона с массивом days... }}
+}}"""
+
+    res = await ask_ai(prompt, system="Отвечай строго валидным JSON.", temperature=0.3)
+    comment = f"Продукт «{prod_txt}» успешно учтен в вашем рационе!"
     try:
-        datetime.strptime(date_str, "%d.%m.%Y")
-    except ValueError:
-        await message.answer("⚠️ Некорректная дата в календаре! Проверьте формат ДД.ММ.ГГГГ:", reply_markup=kb_back_only("open_fridge_app"))
-        return
+        parsed = json.loads(clean_json_str(res))
+        if "updated_diet" in parsed and "days" in parsed["updated_diet"]:
+            update_user(uid, current_diet_json=json.dumps(parsed["updated_diet"], ensure_ascii=False), shopping_list_cache=None)
+        if parsed.get("trainer_comment"):
+            comment = parsed["trainer_comment"]
+    except Exception:
+        pass
 
-    add_product_db(message.from_user.id, name_str, date_str)
-    await state.set_state(FridgeSG.confirm_more)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🥗 Открыть обновленный рацион", callback_data="viewday_0")]])
+    await bot.edit_message_text(f"✅ **Готово!**\n\n💬 {comment}", chat_id=message.chat.id, message_id=prompt_mid, parse_mode="Markdown", reply_markup=kb)
 
-    b = InlineKeyboardBuilder()
-    b.button(text="Да", callback_data="fridge_more_yes")
-    b.button(text="Нет", callback_data="fridge_more_no")
-    b.button(text="🔙 Назад", callback_data="open_fridge_app")
-    b.adjust(2, 1)
-
-    await message.answer(
-        f"✅ <b>Готово!</b> ({name_str} — до {date_str})\nДобавить ли еще продукт?",
-        reply_markup=b.as_markup(),
-    )
-
-
-@router.callback_query(FridgeSG.confirm_more, F.data == "fridge_more_yes")
-async def cb_fridge_more_yes(call: CallbackQuery, state: FSMContext):
-    await state.set_state(FridgeSG.entering_product)
-    await call.message.edit_text(
-        "✅ <b>Сохранено!</b>\nВведите название следующего продукта и срок годности (например: <code>Молоко 20.05.2026</code>):",
-        reply_markup=kb_back_only("open_fridge_app"),
-    )
-
-
-@router.callback_query(FridgeSG.confirm_more, F.data == "fridge_more_no")
-async def cb_fridge_more_no(call: CallbackQuery, state: FSMContext):
+# ==========================================
+# ПРОДУКТОВЫЙ КОНТРОЛЬ (СРОКИ ГОДНОСТИ)
+# ==========================================
+@router.callback_query(F.data.in_({"mode_products", "switch_to_fridge", "back_to_fridge"}))
+async def start_products_mode(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    user = get_user(call.from_user.id)
-    has_diet = bool(user and user.get("current_diet_json"))
+    uid = callback.from_user.id
+    update_user(uid, mode="products")
+    await show_product_control(uid, callback.message)
 
-    # Замечание 10: предлагаем создать рацион ТОЛЬКО ОДИН РАЗ и только если пользователь еще не пользуется рационом!
-    if not has_diet and not (user and user.get("offered_diet")):
-        save_user_field(call.from_user.id, offered_diet=1)
-        b = InlineKeyboardBuilder()
-        b.button(text="Да", callback_data="fridge_create_diet_yes")
-        b.button(text="Нет", callback_data="fridge_create_diet_no")
-        b.adjust(2)
-        await call.message.edit_text(
-            "✅ <b>Сохранено!</b> Жду ваших команд.\n\nХотите создать рацион (с обязательным учетом продуктов, которые уже есть у вас)?",
-            reply_markup=b.as_markup(),
-        )
-    else:
-        await call.message.edit_text(
-            "✅ <b>Сохранено!</b>\n\n" + format_fridge_list(call.from_user.id),
-            reply_markup=kb_fridge_dashboard(has_diet),
+    # Однократное ненавязчивое предложение функции «Рацион», если она еще не заполнена
+    u = get_user(uid)
+    if not u.get("current_diet_json") and not u.get("offered_diet"):
+        update_user(uid, offered_diet=1)
+        offer_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🥗 Попробовать персональный Рацион", callback_data="mode_diet")]
+        ])
+        await bot.send_message(
+            callback.message.chat.id,
+            "💡 **Кстати!** Я также умею составлять персональный **«🥗 Рацион питания»** под ваши цели, бюджет и магазины с подробными рецептами и списком покупок!",
+            parse_mode="Markdown",
+            reply_markup=offer_kb
         )
 
+async def show_product_control(uid: int, message: Message):
+    prods = get_products_db(uid)
+    now_date = get_msk_now().date()
+    lines = ["📦 **Продуктовый контроль (Ваш холодильник):**\n"]
 
-@router.callback_query(F.data == "fridge_create_diet_yes")
-async def cb_fridge_create_diet_yes(call: CallbackQuery, state: FSMContext):
-    user = get_user(call.from_user.id)
-    if user and user.get("height") and user.get("weight") and user.get("current_diet_json"):
-        await cb_regen_full_diet(call)
-    else:
-        await state.update_data(step_history=["ask_custom_bju_choice"])
-        await render_onboarding_step(call.message, state, "ask_custom_bju_choice", call.from_user.id, is_edit=True)
-
-
-@router.callback_query(F.data == "fridge_create_diet_no")
-async def cb_fridge_create_diet_no(call: CallbackQuery, state: FSMContext):
-    await open_fridge_dashboard(call, state)
-
-
-@router.callback_query(F.data == "fridge_del_menu")
-async def cb_fridge_del_menu(call: CallbackQuery):
-    prods = get_products_db(call.from_user.id)
     if not prods:
-        await call.answer("Список продуктов пуст!", show_alert=True)
-        return
-    b = InlineKeyboardBuilder()
-    for p in prods:
-        b.button(text=f"❌ {p['name']} ({p['exp_date']})", callback_data=f"delprod_{p['id']}")
-    b.button(text="🔙 Назад", callback_data="open_fridge_app")
-    b.adjust(1)
-    await call.message.edit_text("Нажмите на продукт, который хотите убрать из списка:", reply_markup=b.as_markup())
+        lines.append("_Ваш список пока пуст. Добавьте продукты, чтобы я следил за их сроком годности!_")
+    else:
+        for idx, p in enumerate(prods, 1):
+            exp_dt = datetime.strptime(p["exp_date"], "%d.%m.%Y").date()
+            diff = (exp_dt - now_date).days
+            if diff < 0:
+                status = f"❌ **СТУХ!** ({p['exp_date']})"
+            elif diff == 0:
+                status = f"⚠️ Истекает сегодня! ({p['exp_date']})"
+            elif diff == 1:
+                status = f"⚠️ Стухнет завтра! ({p['exp_date']})"
+            elif diff <= 5:
+                status = f"⏳ Осталось {diff} дн. (до {p['exp_date']})"
+            else:
+                status = f"✅ до {p['exp_date']}"
+            lines.append(f"{idx}. **{p['name']}** — {status}")
 
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить продукт", callback_data="prod_add"),
+         InlineKeyboardButton(text="➖ Убрать продукт", callback_data="prod_del")],
+        [InlineKeyboardButton(text="🥑 Вписать продукт в рацион", callback_data="insert_bought_prod")],
+        [InlineKeyboardButton(text="🥗 Перейти в Рацион", callback_data="mode_diet")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_modes")]
+    ])
+    await safe_edit(message, "\n".join(lines), kb)
+
+def render_draft_screen(items: list):
+    lines = "\n".join([f"{i + 1}. {it['name']} — {it['date']}" for i, it in enumerate(items)])
+    text = (
+        f"📝 **Черновик продуктов (проверьте перед сохранением):**\n\n"
+        f"{lines}\n\n"
+        f"Всё верно? Вы можете подтвердить сохранение или исправить список:"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Подтвердить и сохранить", callback_data="draft_confirm")],
+        [InlineKeyboardButton(text="✏️ Исправить черновик", callback_data="draft_edit")],
+        [InlineKeyboardButton(text="➕ Добавить ещё", callback_data="prod_add")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="prod_add")]
+    ])
+    return text, kb
+
+async def parse_products_with_ai(raw_text: str) -> list:
+    now_str = get_msk_now().strftime("%d.%m.%Y")
+    prompt = f"""Сегодняшняя дата: {now_str}.
+Пользователь передал список продуктов для холодильника:
+"{raw_text}"
+
+Правила разбора:
+1. Выдели каждый продукт, его фирму (если названа) и количество.
+2. Если пользователь назвал разное количество с разными сроками (например: "2 творога Твой день до 12.02.2026 и 3 до 15.02.2026"), создай две отдельные записи:
+   - "Творог Твой день (2 шт.)" со сроком "12.02.2026"
+   - "Творог Твой день (3 шт.)" со сроком "15.02.2026"
+3. Если у свежего продукта без маркировки (мясо, овощи, фрукты) не назван срок годности, сам рассчитай среднестатистический срок хранения в холодильнике от сегодняшней даты ({now_str}).
+4. Верни СТРОГО JSON массив объектов формата:
+[
+  {{"name": "Название продукта", "date": "ДД.ММ.ГГГГ"}}
+]"""
+    res = await ask_ai(prompt, system="Отвечай строго валидным JSON массивом.", temperature=0.1)
+    try:
+        arr = json.loads(clean_json_str(res))
+        valid = []
+        for item in arr:
+            n = str(item.get("name", "")).strip()
+            d = str(item.get("date", "")).strip()
+            datetime.strptime(d, "%d.%m.%Y")
+            if n:
+                valid.append({"name": n, "date": d})
+        return valid
+    except Exception:
+        return []
+
+@router.callback_query(F.data == "prod_add")
+async def prod_add_menu(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    webapp_url = (
+        f"{SCANNER_WEBAPP_URL}#bot={BOT_TOKEN}"
+        f"&or={OPENROUTER_API_KEY}"
+        f"&cid={callback.message.chat.id}"
+        f"&mid={callback.message.message_id}"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📷 Сканировать ЧЗ", web_app=WebAppInfo(url=webapp_url))],
+        [
+            InlineKeyboardButton(text="🎙 Голосовое", callback_data="prod_add_voice"),
+            InlineKeyboardButton(text="✍️ Вручную", callback_data="prod_add_manual")
+        ],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_fridge")]
+    ])
+    await safe_edit(
+        callback.message,
+        "➕ **Добавление продуктов**\n\n"
+        "Выберите способ добавления:\n"
+        "⚠️ _Продукты без маркировки (свежие овощи, фрукты, мясо на развес) вводятся вручную._",
+        kb
+    )
+
+@router.callback_query(F.data == "prod_add_manual")
+async def prod_add_manual_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(ProductSG.waiting_product_input)
+    await state.update_data(prompt_mid=callback.message.message_id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="prod_add")]])
+    await safe_edit(
+        callback.message,
+        "✍️ **Ручной ввод**\n\n"
+        "Напишите название продукта (желательно с фирмой) и дату окончания срока годности:\n"
+        "`Сыр пармезан 12.02.2027`\n\n"
+        "💡 _Для свежих продуктов без маркировки можно написать просто название — бот сам рассчитает средний срок хранения._",
+        kb
+    )
+
+@router.callback_query(F.data == "prod_add_voice")
+async def prod_add_voice_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(ProductSG.waiting_voice_input)
+    await state.update_data(prompt_mid=callback.message.message_id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="prod_add")]])
+    await safe_edit(
+        callback.message,
+        "🎙 **Голосовой ввод**\n\n"
+        "Запишите голосовое сообщение: назовите продукт и срок годности (**желательно с фирмой**, чтобы не перепутать разные марки).\n\n"
+        "💡 _Например: «2 творога Твой день до 12.02.2026 и 3 до 15.02.2026»._",
+        kb
+    )
+
+@router.message(ProductSG.waiting_product_input)
+async def prod_add_process(message: Message, state: FSMContext):
+    txt = (message.text or "").strip()
+    data = await state.get_data()
+    prompt_mid = data.get("prompt_mid")
+    await try_delete_user_msg(message)
+
+    m = re.match(r"^(.+?)\s+(\d{2}\.\d{2}\.\d{4})$", txt)
+    items = []
+    if m and "," not in txt and "\n" not in txt and " и " not in txt.lower():
+        name, dt_str = m.group(1).strip(), m.group(2).strip()
+        try:
+            datetime.strptime(dt_str, "%d.%m.%Y")
+            items = [{"name": name, "date": dt_str}]
+        except ValueError:
+            items = []
+
+    if not items:
+        items = await parse_products_with_ai(txt)
+
+    if not items:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="prod_add")]])
+        err_text = "⚠️ Не удалось распознать продукт и дату. Попробуйте написать, например: `Сыр Ламбер 12.02.2027`"
+        if prompt_mid:
+            try:
+                await bot.edit_message_text(err_text, chat_id=message.chat.id, message_id=prompt_mid, parse_mode="Markdown", reply_markup=kb)
+                return
+            except Exception:
+                pass
+        await message.answer(err_text, parse_mode="Markdown", reply_markup=kb)
+        return
+
+    existing = data.get("draft_items", [])
+    existing.extend(items)
+    await state.update_data(draft_items=existing)
+    draft_text, draft_kb = render_draft_screen(existing)
+
+    if prompt_mid:
+        try:
+            await bot.edit_message_text(draft_text, chat_id=message.chat.id, message_id=prompt_mid, parse_mode="Markdown", reply_markup=draft_kb)
+            return
+        except Exception:
+            pass
+    await message.answer(draft_text, parse_mode="Markdown", reply_markup=draft_kb)
+
+@router.message(ProductSG.waiting_voice_input, F.voice)
+async def prod_voice_process(message: Message, state: FSMContext):
+    data = await state.get_data()
+    prompt_mid = data.get("prompt_mid")
+    await try_delete_user_msg(message)
+
+    if prompt_mid:
+        try:
+            await bot.edit_message_text("⏳ **Распознаю голосовое сообщение...**", chat_id=message.chat.id, message_id=prompt_mid, parse_mode="Markdown")
+        except Exception:
+            pass
+
+    file_info = await bot.get_file(message.voice.file_id)
+    bio = io.BytesIO()
+    await bot.download_file(file_info.file_path, destination=bio)
+    b64_audio = base64.b64encode(bio.getvalue()).decode("utf-8")
+
+    now_str = get_msk_now().strftime("%d.%m.%Y")
+    prompt = f"""Сегодняшняя дата: {now_str}.
+Прослушай голосовое сообщение пользователя и выдели все названные продукты и их сроки годности.
+Если пользователь говорит, например: "2 творога Твой день до 12.02.2026 и 3 до 15.02.2026", создай две записи:
+- {{"name": "Творог Твой день (2 шт.)", "date": "12.02.2026"}}
+- {{"name": "Творог Твой день (3 шт.)", "date": "15.02.2026"}}
+Ответь СТРОГО валидным JSON массивом объектов: [{{"name": "...", "date": "ДД.ММ.ГГГГ"}}]"""
+
+    def _call_audio_ai():
+        headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
+        for m_name in ["google/gemini-2.0-flash-exp:free", "google/gemini-2.0-flash-001"]:
+            try:
+                payload = {
+                    "model": m_name,
+                    "temperature": 0.1,
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "input_audio", "input_audio": {"data": b64_audio, "format": "ogg"}}
+                        ]
+                    }]
+                }
+                r = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=45)
+                if r.status_code == 200:
+                    return r.json()["choices"][0]["message"]["content"]
+            except Exception:
+                pass
+        return ""
+
+    raw_ai = await asyncio.to_thread(_call_audio_ai)
+    items = []
+    try:
+        arr = json.loads(clean_json_str(raw_ai))
+        for it in arr:
+            n = str(it.get("name", "")).strip()
+            d = str(it.get("date", "")).strip()
+            datetime.strptime(d, "%d.%m.%Y")
+            if n:
+                items.append({"name": n, "date": d})
+    except Exception:
+        items = []
+
+    if not items:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="prod_add")]])
+        err_msg = "⚠️ Не удалось разобрать продукты и даты в голосовом сообщении. Попробуйте записать ещё раз четко."
+        if prompt_mid:
+            await bot.edit_message_text(err_msg, chat_id=message.chat.id, message_id=prompt_mid, reply_markup=kb)
+        else:
+            await message.answer(err_msg, reply_markup=kb)
+        return
+
+    existing = data.get("draft_items", [])
+    existing.extend(items)
+    await state.update_data(draft_items=existing)
+    draft_text, draft_kb = render_draft_screen(existing)
+
+    if prompt_mid:
+        await bot.edit_message_text(draft_text, chat_id=message.chat.id, message_id=prompt_mid, parse_mode="Markdown", reply_markup=draft_kb)
+    else:
+        await message.answer(draft_text, parse_mode="Markdown", reply_markup=draft_kb)
+
+def extract_draft_from_message_text(msg_text: str) -> list:
+    items = []
+    for line in (msg_text or "").splitlines():
+        m = re.match(r"^\d+\.\s+(.+?)\s+[—\-]\s+(\d{2}\.\d{2}\.\d{4})$", line.strip())
+        if m:
+            items.append({"name": m.group(1).strip(), "date": m.group(2).strip()})
+    return items
+
+@router.callback_query(F.data == "draft_confirm")
+async def draft_confirm_handler(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    items = data.get("draft_items") or extract_draft_from_message_text(callback.message.text)
+    if not items:
+        await callback.answer("Черновик пуст!", show_alert=True)
+        return
+
+    for it in items:
+        add_product_db(callback.from_user.id, it["name"], it["date"])
+
+    await state.clear()
+    await safe_edit(callback.message, "✅ **Сохранено!**")
+    await asyncio.sleep(0.8)
+    await show_product_control(callback.from_user.id, callback.message)
+
+@router.callback_query(F.data == "draft_edit")
+async def draft_edit_handler(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    items = data.get("draft_items") or extract_draft_from_message_text(callback.message.text)
+    await state.set_state(ProductSG.waiting_draft_edit)
+    await state.update_data(draft_items=items, prompt_mid=callback.message.message_id)
+
+    current_lines = "\n".join([f"{it['name']} {it['date']}" for it in items])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад к черновику", callback_data="draft_back")]])
+    await safe_edit(
+        callback.message,
+        "✏️ **Исправление черновика**\n\n"
+        "Скопируйте список ниже, исправьте нужные названия или даты и отправьте ответным сообщением:\n\n"
+        f"`{current_lines}`",
+        kb
+    )
+
+@router.callback_query(F.data == "draft_back")
+async def draft_back_handler(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    items = data.get("draft_items", [])
+    if not items:
+        await prod_add_menu(callback, state)
+        return
+    draft_text, draft_kb = render_draft_screen(items)
+    await safe_edit(callback.message, draft_text, draft_kb)
+
+@router.message(ProductSG.waiting_draft_edit)
+async def draft_edit_save(message: Message, state: FSMContext):
+    txt = (message.text or "").strip()
+    data = await state.get_data()
+    prompt_mid = data.get("prompt_mid")
+    await try_delete_user_msg(message)
+
+    new_items = []
+    for line in txt.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(r"^(.+?)\s+(\d{2}\.\d{2}\.\d{4})$", line)
+        if m:
+            new_items.append({"name": m.group(1).strip(), "date": m.group(2).strip()})
+
+    if not new_items:
+        new_items = await parse_products_with_ai(txt)
+
+    if new_items:
+        await state.update_data(draft_items=new_items)
+        draft_text, draft_kb = render_draft_screen(new_items)
+        if prompt_mid:
+            await bot.edit_message_text(draft_text, chat_id=message.chat.id, message_id=prompt_mid, parse_mode="Markdown", reply_markup=draft_kb)
+            return
+        await message.answer(draft_text, parse_mode="Markdown", reply_markup=draft_kb)
+
+@router.callback_query(F.data == "prod_del")
+async def prod_del_list(callback: CallbackQuery):
+    prods = get_products_db(callback.from_user.id)
+    if not prods:
+        await callback.answer("Список продуктов пуст!", show_alert=True)
+        return
+    kb = []
+    for p in prods:
+        kb.append([InlineKeyboardButton(text=f"❌ {p['name']} ({p['exp_date']})", callback_data=f"delprod_{p['id']}")])
+    kb.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_fridge")])
+    await safe_edit(callback.message, "Выберите продукт, который вы съели или выбросили:", InlineKeyboardMarkup(inline_keyboard=kb))
 
 @router.callback_query(F.data.startswith("delprod_"))
-async def cb_del_prod_item(call: CallbackQuery, state: FSMContext):
-    prod_id = int(call.data.split("_")[1])
-    delete_product_db(prod_id, call.from_user.id)
-    await call.answer("✅ Продукт удален!")
-    prods = get_products_db(call.from_user.id)
-    if prods:
-        await cb_fridge_del_menu(call)
-    else:
-        await open_fridge_dashboard(call, state)
-
+async def prod_del_confirm(callback: CallbackQuery):
+    pid = int(callback.data.split("_")[1])
+    delete_product_db(pid, callback.from_user.id)
+    await show_product_control(callback.from_user.id, callback.message)
 
 # ==========================================
-# 10. ФОНОВЫЕ ЗАДАЧИ И НАПОМИНАНИЯ (МСК)
+# ФОНОВЫЕ ЗАДАЧИ: УВЕДОМЛЕНИЯ, СОВЕТЫ В 12:00, КОНТРОЛЬ СРОКОВ
 # ==========================================
-async def send_daily_tip(user: dict):
-    history = json.loads(user.get("tips_history_json") or "[]")
-    recent_tips = "; ".join(history[-30:]) if history else "нет"
-
-    sys_p = (
-        "Ты профессиональный тренер и спортивный нутрициолог. "
-        "Напиши ОДИН краткий (2-3 предложения), но очень полезный, научно достоверный практический совет по тренировкам или спортивному питанию."
+async def send_daily_tip_to_user(uid: int):
+    u = get_user(uid)
+    hist = json.loads(u.get("tips_history_json") or "[]")
+    avoid_str = "; ".join(hist[-25:]) if hist else "нет"
+    prompt = (
+        f"Напиши один короткий, научно обоснованный и практически полезный совет (3–5 предложений) "
+        f"по тренировкам, восстановлению или спортивному питанию (цель пользователя: {u.get('goal') or 'здоровье и форма'}).\n"
+        f"НЕ ПОВТОРЯЙ темы из этого списка: {avoid_str}."
     )
-    usr_p = (
-        f"Напиши новый совет (например, про питание после тренировки, ужин за 2-3 часа до сна, творог/кефир на ночь, восстановление и т.д.). "
-        f"НЕ ПОВТОРЯЙ эти прошлые темы: {recent_tips}."
-    )
-    tip = await asyncio.to_thread(giga.ask, sys_p, usr_p, 0.8)
-    if not tip:
-        tip = "После тренировки желательно принять пищу (белки + углеводы) в первый час, чтобы восполнить запасы гликогена и запустить восстановление мышц."
-
-    history.append(tip[:80])
-    save_user_field(user["user_id"], tips_history_json=json.dumps(history[-100:], ensure_ascii=False))
-
-    b = InlineKeyboardBuilder()
-    b.button(text="🥗 Рацион", callback_data="view_week_summary")
-    b.button(text="📦 Контроль продуктов", callback_data="open_fridge_app")
-    b.adjust(2)
-
-    await bot.send_message(
-        user["user_id"],
-        f"💪 <b>Полезный совет дня по тренировкам и питанию:</b>\n\n{tip}",
-        reply_markup=b.as_markup(),
-    )
-
-
-async def minute_scheduler_tick():
-    now_msk = datetime.now(MSK_TZ)
-    curr_hm = now_msk.strftime("%H:%M")
-    today_dm = now_msk.strftime("%d.%m")
-
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM users")
-    users = [dict(r) for r in c.fetchall()]
-    conn.close()
-
-    for u in users:
-        uid = u["user_id"]
-        notify_hm = u.get("notify_time") or "08:00"
-
-        if u.get("current_diet_json") and curr_hm == notify_hm:
-            try:
-                diet_data = json.loads(u["current_diet_json"])
-                days = diet_data.get("days", [])
-                day_obj = next((d for d in days if d.get("day_name") == today_dm), days[0])
-                text, kb = format_day_text_and_kb(diet_data, int(day_obj.get("day_num", 1)), "curr")
-                await bot.send_message(
-                    uid,
-                    f"☀️ <b>Доброе утро! Ваш подробный рацион на сегодня ({today_dm}):</b>\n\n{text}",
-                    reply_markup=kb,
-                )
-            except Exception as e:
-                logging.error(f"Daily menu send error for {uid}: {e}")
-
+    tip = await ask_ai(prompt, temperature=0.7)
+    if tip:
+        short_topic = tip[:50].replace("\n", " ")
+        hist.append(short_topic)
+        update_user(uid, tips_history_json=json.dumps(hist[-50:], ensure_ascii=False))
         try:
-            nh, nm = [int(x) for x in notify_hm.split(":")]
-            notify_minutes = nh * 60 + nm
-            default_tip_minutes = 12 * 60
+            await bot.send_message(uid, f"💡 **Совет дня по питанию и тренировкам:**\n\n{tip}", parse_mode="Markdown")
+        except Exception:
+            pass
 
-            if abs(default_tip_minutes - notify_minutes) < 40 and default_tip_minutes >= notify_minutes:
-                tip_minutes = notify_minutes + 40
-            else:
-                tip_minutes = default_tip_minutes
-
-            tip_hm = f"{tip_minutes // 60:02d}:{tip_minutes % 60:02d}"
-            if curr_hm == tip_hm:
-                await send_daily_tip(u)
-        except Exception as e:
-            logging.error(f"Tip schedule error for {uid}: {e}")
-
-
-async def daily_morning_checks():
-    today = datetime.now(MSK_TZ).date()
+async def cron_minute_dispatcher():
+    now = get_msk_now()
+    cur_hm = now.strftime("%H:%M")
+    cur_date_str = now.strftime("%d.%m")
 
     conn = sqlite3.connect(DB_NAME)
     conn.row_factory = sqlite3.Row
@@ -2148,89 +1928,93 @@ async def daily_morning_checks():
 
     for u in users:
         uid = u["user_id"]
-        prods = get_products_db(uid)
-        alerts = []
+        nt = u.get("notify_time")
 
-        for p in prods:
+        # 1. Ежедневное утреннее напоминание рациона
+        if nt and nt == cur_hm and u.get("current_diet_json"):
+            diet = json.loads(u["current_diet_json"])
+            days = diet.get("days", [])
+            day_idx = 0
+            for idx, d in enumerate(days):
+                if d.get("date") == cur_date_str:
+                    day_idx = idx
+                    break
+            text, kb = render_diet_day(uid, day_idx)
             try:
-                exp_d = datetime.strptime(p["exp_date"], "%d.%m.%Y").date()
-                diff = (exp_d - today).days
+                await bot.send_message(uid, f"☀️ **Доброе утро! Ваш план питания на сегодня ({cur_date_str}):**\n\n{text}", parse_mode="Markdown", reply_markup=kb)
+            except Exception:
+                pass
+
+            # На 7-й день рациона предлагаем составить рацион на следующую неделю
+            if day_idx == len(days) - 1:
+                try:
+                    n_kb = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="⏭ Составить рацион на след. неделю", callback_data="gen_next_week")]
+                    ])
+                    await bot.send_message(uid, "📆 Сегодня 7-й день вашего недельного рациона! Хотите сформировать свежее меню и список покупок на следующую неделю?", reply_markup=n_kb)
+                except Exception:
+                    pass
+
+        # 2. Ежедневный совет в 12:00 МСК (с защитой от пересечения с утренним уведомлением в пределах 40 минут)
+        if u.get("current_diet_json"):
+            tip_hm = "12:00"
+            if nt:
+                nh, nm = map(int, nt.split(":"))
+                diff_mins = abs((nh * 60 + nm) - (12 * 60))
+                if diff_mins < 40:
+                    shifted = (datetime(2000, 1, 1, nh, nm) + timedelta(minutes=40)).strftime("%H:%M")
+                    tip_hm = shifted
+            if cur_hm == tip_hm:
+                asyncio.create_task(send_daily_tip_to_user(uid))
+
+        # 3. Ежедневная проверка сроков годности продуктов в 09:00 МСК
+        if cur_hm == "09:00":
+            prods = get_products_db(uid)
+            alerts = []
+            for p in prods:
+                exp_dt = datetime.strptime(p["exp_date"], "%d.%m.%Y").date()
+                diff = (exp_dt - now.date()).days
                 if diff == 5:
-                    alerts.append(f"⚠️ <b>{p['name']}</b> стухнет через 5 дней, срок годности до {p['exp_date']}")
+                    alerts.append(f"⏳ **{p['name']}** — до конца срока годности осталось 5 дней ({p['exp_date']}).")
                 elif diff == 2:
-                    alerts.append(f"⚠️ <b>{p['name']}</b> стухнет через 2 дня, срок годности до {p['exp_date']}")
+                    alerts.append(f"⚠️ **{p['name']}** — осталось всего 2 дня ({p['exp_date']})!")
                 elif diff == 1:
-                    alerts.append(f"⏳ <b>{p['name']}</b> стухнет завтра, срок годности до {p['exp_date']}")
+                    alerts.append(f"🚨 **{p['name']}** стухнет завтра ({p['exp_date']})!")
                 elif diff <= 0:
-                    alerts.append(f"❌ <b>{p['name']} стух! {p['exp_date']}</b>")
-            except Exception:
-                pass
+                    alerts.append(f"❌ **{p['name']} стух! {p['exp_date']}** — выбросьте его и удалите из списка!")
+            if alerts:
+                kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📦 Открыть холодильник", callback_data="switch_to_fridge")]])
+                try:
+                    await bot.send_message(uid, "🔔 **Контроль сроков годности:**\n\n" + "\n".join(alerts), parse_mode="Markdown", reply_markup=kb)
+                except Exception:
+                    pass
 
-        if alerts:
-            b = InlineKeyboardBuilder()
-            b.button(text="📦 Контроль продуктов", callback_data="open_fridge_app")
-            await bot.send_message(
-                uid,
-                "🔔 <b>Контроль срока годности продуктов:</b>\n\n" + "\n".join(alerts),
-                reply_markup=b.as_markup(),
-            )
-
-        if u.get("diet_start_date"):
+        # 4. Ежемесячный опрос изменений (раз в 30 дней в 10:00)
+        if cur_hm == "10:00" and u.get("last_month_check"):
             try:
-                start_d = datetime.strptime(u["diet_start_date"], "%d.%m.%Y").date()
-                days_passed = (today - start_d).days
-                if days_passed == 6:
-                    b = InlineKeyboardBuilder()
-                    b.button(text="Да", callback_data="gen_next_week")
-                    b.button(text="Нет", callback_data="view_week_summary")
-                    b.adjust(2)
+                last_dt = datetime.strptime(u["last_month_check"], "%Y-%m-%d").date()
+                if (now.date() - last_dt).days >= 30:
+                    update_user(uid, last_month_check=now.strftime("%Y-%m-%d"))
+                    m_kb = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="🔄 Обновить вес / цель / бюджет", callback_data="mode_diet")],
+                        [InlineKeyboardButton(text="✅ Оставить всё как есть", callback_data="viewday_0")]
+                    ])
                     await bot.send_message(
                         uid,
-                        "📅 <b>Сегодня последний день вашего недельного рациона!</b>\nПоказать рацион на следующую неделю?",
-                        reply_markup=b.as_markup(),
+                        "🗓 **Прошел месяц тренировок и режима!**\n"
+                        "Изменился ли ваш вес, цель, количество тренировок или бюджет? Мы можем пересчитать ваше БЖУ и обновить рацион!",
+                        parse_mode="Markdown",
+                        reply_markup=m_kb
                     )
             except Exception:
                 pass
 
-        if u.get("last_month_check"):
-            try:
-                last_m = datetime.strptime(u["last_month_check"], "%d.%m.%Y").date()
-                if (today - last_m).days >= 30:
-                    save_user_field(uid, last_month_check=today.strftime("%d.%m.%Y"))
-                    b = InlineKeyboardBuilder()
-                    b.button(text="🔄 Обновить данные", callback_data="open_profile_edit_menu")
-                    await bot.send_message(
-                        uid,
-                        "🏆 <b>Прошел месяц! Как ваши успехи?</b>\n"
-                        "Давайте обновим ваш текущий вес, количество тренировок и сформируем свежий рацион по новым данным!",
-                        reply_markup=b.as_markup(),
-                    )
-            except Exception:
-                pass
-
-
-# Строгий перехватчик нецелевых сообщений ТОЛЬКО во время прохождения анкеты (стоит в самом низу, чтобы не мешать кнопкам)
-@router.message(StateFilter(OnboardingSG))
-async def fallback_onboarding_strict(message: Message):
-    await message.answer(
-        "⚠️ <b>Ответьте на предыдущий вопрос!</b> Бот ждет вашего ответа по плану.",
-        reply_markup=kb_back_only(),
-    )
-
-
-# ==========================================
-# 11. ЗАПУСК БОТА
-# ==========================================
 async def main():
     init_db()
-    scheduler = AsyncIOScheduler(timezone=MSK_TZ)
-    scheduler.add_job(minute_scheduler_tick, "cron", second=0)
-    scheduler.add_job(daily_morning_checks, "cron", hour=9, minute=0)
+    scheduler.add_job(cron_minute_dispatcher, "cron", second=0)
     scheduler.start()
-
-    logging.info("Бот успешно запущен!")
+    logging.info("Bot started successfully!")
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
