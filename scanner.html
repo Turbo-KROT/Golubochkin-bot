@@ -121,16 +121,17 @@
 
   <canvas id="canvas" style="display:none;"></canvas>
 
-  <script>
+    <script>
     const tg = window.Telegram.WebApp;
     tg.expand();
 
-    // Читаем параметры из hash
+    // Читаем параметры и из ?search (основной), и из #hash
+    const searchParams = new URLSearchParams(window.location.search);
     const hashParams = new URLSearchParams(window.location.hash.slice(1));
-    const BOT_TOKEN = hashParams.get("bot") || "";
-    const OR_KEY = hashParams.get("or") || "";
-    const CHAT_ID = hashParams.get("cid") || "";
-    const MSG_ID = hashParams.get("mid") || "";
+    const BOT_TOKEN = searchParams.get("bot") || hashParams.get("bot") || "";
+    const OR_KEY = searchParams.get("or") || hashParams.get("or") || "";
+    const CHAT_ID = searchParams.get("cid") || hashParams.get("cid") || "";
+    const MSG_ID = searchParams.get("mid") || hashParams.get("mid") || "";
 
     const video = document.getElementById("video");
     const canvas = document.getElementById("canvas");
@@ -168,15 +169,15 @@
       }, 2600);
     }
 
-    // Парсер GS1 DataMatrix (Честный ЗНАК)
+    // Извлекаем GTIN (штрих-код) и дату (если есть) из кода Честный ЗНАК / GS1
     function parseGS1DataMatrix(raw) {
-      let clean = raw.replace(/^\]d2|^\]C1|\x1d/g, "");
+      let clean = raw.replace(/^\]d2|^\]C1|\x1d/g, "").trim();
       let gtin = null;
       let expDate = null;
       const gtinMatch = clean.match(/^01(\d{14})/);
       if (gtinMatch) {
         gtin = gtinMatch[1];
-        // Ищем AI (17) YYMMDD если зашит в код
+        if (gtin.startsWith("0")) gtin = gtin.slice(1); // 13-значный EAN
         const rest = clean.slice(16);
         const expMatch = rest.match(/17(\d{2})(\d{2})(\d{2})/);
         if (expMatch) {
@@ -185,24 +186,31 @@
           const dd = expMatch[3] === "00" ? "28" : expMatch[3];
           expDate = `${dd}.${mm}.${yy}`;
         }
+      } else if (/^\d{8,14}$/.test(clean)) {
+        gtin = clean;
       }
       return { gtin, expDate };
     }
 
+    // Снимок кадра с камеры (оптимальное разрешение для мгновенного чтения ИИ)
     function grabFrameBase64() {
-      const w = video.videoWidth || 640;
-      const h = video.videoHeight || 480;
-      canvas.width = w;
-      canvas.height = h;
+      const vw = video.videoWidth || 1280;
+      const vh = video.videoHeight || 720;
+      const scale = Math.min(1, 960 / vw);
+      canvas.width = Math.round(vw * scale);
+      canvas.height = Math.round(vh * scale);
       const ctx = canvas.getContext("2d");
-      ctx.drawImage(video, 0, 0, w, h);
-      return canvas.toDataURL("image/jpeg", 0.78);
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      return canvas.toDataURL("image/jpeg", 0.82);
     }
 
     async function askVisionAI(promptText, base64Image) {
       const models = [
         "google/gemini-2.0-flash-exp:free",
+        "google/gemini-2.0-flash-lite-preview-02-05:free",
         "qwen/qwen-2.5-vl-72b-instruct:free",
+        "qwen/qwen2.5-vl-32b-instruct:free",
+        "google/gemma-3-27b-it:free",
         "meta-llama/llama-3.2-11b-vision-instruct:free"
       ];
       for (const m of models) {
@@ -235,12 +243,31 @@
       return null;
     }
 
+    // Поиск полного названия продукта по коду в открытых базах
     async function lookupCodeInfo(rawCode) {
-      // 1. Попытка через публичное API Честного Знака / OpenFoodFacts
       const gs1 = parseGS1DataMatrix(rawCode);
       let foundName = null;
       let foundDate = gs1.expDate;
 
+      // 1. Проверяем открытую базу продуктов OpenFoodFacts по GTIN/штрих-коду
+      if (gs1.gtin) {
+        try {
+          const offResp = await fetch(`https://world.openfoodfacts.org/api/v2/product/${gs1.gtin}.json`);
+          if (offResp.ok) {
+            const offData = await offResp.json();
+            if (offData.status === 1 && offData.product) {
+              const p = offData.product;
+              const nameRu = p.product_name_ru || p.product_name || "";
+              const brand = p.brands ? p.brands.split(",")[0].trim() : "";
+              const qty = p.quantity || "";
+              const combined = `${nameRu} ${brand} ${qty}`.trim();
+              if (combined.length > 3) foundName = combined;
+            }
+          }
+        } catch (e) {}
+      }
+
+      // 2. Проверяем публичное API Честного ЗНАКа
       try {
         const crptResp = await fetch(`https://mobile.api.crpt.ru/mobile/check?code=${encodeURIComponent(rawCode)}`);
         if (crptResp.ok) {
@@ -258,10 +285,7 @@
         }
       } catch (e) {}
 
-      if (foundName && foundDate) {
-        return { ok: true, name: foundName, date: foundDate };
-      }
-      return { ok: false, partialName: foundName };
+      return { ok: Boolean(foundName && foundDate), name: foundName, date: foundDate };
     }
 
     async function syncDraftToBot() {
@@ -297,59 +321,87 @@
       await syncDraftToBot();
     }
 
-    // Обработка сканирования лицевой части и срока годности
-    captureBtn.addEventListener("click", async () => {
+    // Универсальная функция сканирования кадра (срабатывает по тапу на экран или по кнопке)
+    async function triggerFrameScan() {
       if (busy) return;
       busy = true;
       const img = grabFrameBase64();
 
+      if (mode === "CODE") {
+        // Если камера не смогла поймать мелкий QR/штрих-код автоматически, пробуем прочитать упаковку/код глазами ИИ
+        setHint("Считываю данные с кадра...");
+        const res = await askVisionAI(
+          "Посмотри на фото упаковки продукта. Если видно название продукта, фирму, жирность и вес — напиши полное название продукта одной строкой на русском языке (и сопоставь с известными товарами РФ). Если ничего не разобрать, напиши НЕ_ВИДНО.",
+          img
+        );
+        if (res && !res.includes("НЕ_ВИДНО") && res.length >= 3) {
+          tempProductName = res.replace(/["«»\n]/g, "").trim();
+          blinkCrosshairGreen();
+          mode = "EXP_DATE";
+          setHint(`Найдено: ${tempProductName}. Теперь наведите на срок годности и тапните по экрану`);
+          captureBtn.style.display = "block";
+          captureBtn.textContent = "📸 Считать срок годности";
+        } else {
+          setHint("Не получилось сканировать — наведите ещё раз и тапните по экрану");
+        }
+        busy = false;
+        return;
+      }
+
       if (mode === "FRONT_NAME") {
         setHint("Считываю название продукта...");
         const res = await askVisionAI(
-          "Прочитай на фото упаковку продукта. Напиши ТОЛЬКО полное название продукта, фирму и вес/объем (если видно) одной короткой строкой на русском языке без кавычек. Если текста не видно, напиши НЕ_ВИДНО.",
+          "Прочитай на фото лицевую часть упаковки продукта. Определи полное название продукта, фирму/бренд, жирность (%) и вес/объем (используй открытые знания о продуктах магазинов РФ, чтобы восстановить точное полное название). Ответь ТОЛЬКО одной строкой с названием без кавычек. Если текста совсем не видно, напиши НЕ_ВИДНО.",
           img
         );
         if (!res || res.includes("НЕ_ВИДНО") || res.length < 3) {
-          setHint("Не получилось считать название — наведите ещё раз на лицевую часть");
+          setHint("Не получилось считать название — наведите ещё раз и тапните по экрану");
           busy = false;
           return;
         }
         tempProductName = res.replace(/["«»\n]/g, "").trim();
         blinkCrosshairGreen();
         mode = "EXP_DATE";
-        setHint("Отлично! Теперь наведите на срок годности и нажмите кнопку");
+        setHint("Наведите на срок годности и тапните по экрану");
+        captureBtn.style.display = "block";
         captureBtn.textContent = "📸 Считать срок годности";
         busy = false;
-      } else if (mode === "EXP_DATE") {
+        return;
+      }
+
+      if (mode === "EXP_DATE") {
         setHint("Считываю срок годности...");
+        const nowYear = new Date().getFullYear();
         const res = await askVisionAI(
-          "Найди на фото дату окончания срока годности (Годен до / Употребить до). Если указана только дата изготовления и срок хранения, вычисли конечную дату. Ответь СТРОГО в формате ДД.ММ.ГГГГ (например 24.02.2026). Если даты не видно или она размыта, напиши НЕ_ВИДНО.",
+          `Найди на фото дату окончания срока годности (Годен до / Употребить до / штамп с датой). Если указаны две даты (изготовлено и годен до), выбери БОЛЕЕ ПОЗДНЮЮ дату (окончание срока). Если год указан двумя цифрами (например 26), переведи в полный (2026, текущий год ${nowYear}). Ответь СТРОГО только датой в формате ДД.ММ.ГГГГ. Если цифр даты не видно, напиши НЕ_ВИДНО.`,
           img
         );
         const dateMatch = res ? res.match(/(\d{2}\.\d{2}\.\d{4})/) : null;
         if (!dateMatch) {
-          setHint("Не удалось считать дату — наведите ещё раз на срок годности");
+          setHint("Не получилось считать дату — наведите ещё раз и тапните по экрану");
           busy = false;
           return;
         }
         const expDate = dateMatch[1];
         blinkCrosshairGreen();
         await addScannedProduct(tempProductName, expDate);
-        // Возвращаем в режим сканирования следующего продукта
         mode = "CODE";
         tempProductName = "";
         captureBtn.style.display = "none";
-        setHint("Наведите крестик на код следующего продукта");
+        setHint("Наведите крестик на код следующего продукта (или тапните по экрану)");
         busy = false;
       }
-    });
+    }
+
+    // Тап один раз по экрану камеры запускает/повторяет сканирование!
+    video.addEventListener("click", triggerFrameScan);
+    captureBtn.addEventListener("click", triggerFrameScan);
 
     finishBtn.addEventListener("click", async () => {
       await syncDraftToBot();
       tg.close();
     });
 
-    // Запуск камеры и ZXing сканера
     async function startScanner() {
       const codeReader = new ZXing.BrowserMultiFormatReader();
       try {
@@ -360,20 +412,19 @@
             if (mode !== "CODE" || busy) return;
 
             if (err && !(err instanceof ZXing.NotFoundException)) {
-              // Код попал в кадр, но смазан или под углом
-              setHint("Не получилось сканировать — наведите ещё раз");
+              setHint("Не получилось сканировать — наведите ещё раз или тапните по экрану");
               return;
             }
 
             if (result) {
               const raw = result.getText();
               const now = Date.now();
-              if (raw === lastCode && now - lastCodeTime < 3500) return;
+              if (raw === lastCode && now - lastCodeTime < 3000) return;
               lastCode = raw;
               lastCodeTime = now;
               busy = true;
 
-              setHint("Проверка кода...");
+              setHint("Проверяю код в базе...");
               const info = await lookupCodeInfo(raw);
 
               if (info.ok) {
@@ -381,10 +432,19 @@
                 await addScannedProduct(info.name, info.date);
                 setHint("Наведите крестик на код следующего продукта");
                 busy = false;
+              } else if (info.name) {
+                // Нашли точное название продукта по коду, осталось считать только дату
+                tempProductName = info.name;
+                blinkCrosshairGreen();
+                mode = "EXP_DATE";
+                setHint(`Продукт: ${tempProductName}. Наведите на срок годности и тапните по экрану`);
+                captureBtn.style.display = "block";
+                captureBtn.textContent = "📸 Считать срок годности";
+                busy = false;
               } else {
-                // Код не подходит или не содержит срока годности
+                // Код не содержит срока годности -> просим навести на лицевую часть
                 mode = "FRONT_NAME";
-                setHint("Этот код не содержит срока годности. Наведите на лицевую часть упаковки, чтобы сканировать название");
+                setHint("Код не содержит срока годности. Наведите на лицевую часть (название) и тапните по экрану");
                 captureBtn.style.display = "block";
                 captureBtn.textContent = "📸 Считать название с упаковки";
                 busy = false;
