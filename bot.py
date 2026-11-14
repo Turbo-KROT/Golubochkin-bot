@@ -1259,7 +1259,7 @@ def render_diet_day(uid: int, day_idx: int):
         text += f"💬 _{u['expert_note']}_\n"
     text += "━━━━━━━━━━━━━━━\n\n"
 
-        kb = []
+    kb = []
     for m_idx, m in enumerate(meals):
         if isinstance(m, str):
             m = {"num": m_idx + 1, "title": m}
