@@ -390,6 +390,8 @@ async def generate_weekly_diet_json(u: dict, start_date_str: str, forbidden_dish
 2. Используй простые, базовые и понятные продукты из магазинов ({u['stores']}): куриная грудка/бедро, индейка, обычная постная говядина, яйца, творог, горбуша/минтай/треска, гречка, рис, овсянка, макароны из тв. сортов, картофель, сезонные овощи и фрукты.
 3. Практичность: блюда могут разумно повторяться на 2 дня (чтобы человек не стоял у плиты по 5 раз каждый день с нуля), но рацион на неделю должен быть разнообразным и вкусным.
 4. Все граммовки указывай точно (в граммах сухого/сырого или готового продукта).
+5. БЖУ на каждый прием пищи НЕ ДОЛЖЕН быть одинаковым под копирку! У каждого блюда свой естественный баланс БЖУ (например, на завтрак больше углеводов, на ужин больше белка и клетчатки), а в сумме за день они должны давать около целевых показателей ({u['target_p']}г Б, {u['target_f']}г Ж, {u['target_c']}г У).
+6. Поле "title" у каждого приема пищи ОБЯЗАТЕЛЬНО должно содержать полное название блюда с граммовками.
 
 Верни ответ СТРОГО в формате валидного JSON такой структуры:
 {{
@@ -399,12 +401,21 @@ async def generate_weekly_diet_json(u: dict, start_date_str: str, forbidden_dish
       "meals": [
         {{
           "num": 1,
-          "title": "Понятное название блюда и состав с граммовками (например: Овсянка 70г на молоке + 3 вареных яйца)",
-          "weight": "350 г",
-          "p": 30,
-          "f": 15,
-          "c": 55,
+          "title": "Овсяная каша (70г хлопьев) на молоке 150мл + 3 вареных яйца",
+          "weight": "360 г",
+          "p": 31,
+          "f": 18,
+          "c": 52,
           "short_ingredients": "Овсяные хлопья 70г, молоко 150мл, яйца куриные 3 шт"
+        }},
+        {{
+          "num": 2,
+          "title": "Филе куриной грудки на гриле (150г) + гречка отварная (180г) + салат из огурцов",
+          "weight": "430 г",
+          "p": 42,
+          "f": 7,
+          "c": 64,
+          "short_ingredients": "Филе куриное 150г, гречка 70г сух., огурец 100г"
         }}
       ]
     }}
@@ -1248,14 +1259,20 @@ def render_diet_day(uid: int, day_idx: int):
         text += f"💬 _{u['expert_note']}_\n"
     text += "━━━━━━━━━━━━━━━\n\n"
 
-    kb = []
+        kb = []
     for m_idx, m in enumerate(meals):
+        if isinstance(m, str):
+            m = {"num": m_idx + 1, "title": m}
         m_num = m.get("num", m_idx + 1)
-        m_title = m.get("title") or m.get("name") or "Прием пищи"
-        m_weight = m.get("weight") or m.get("grams") or "—"
-        m_p = m.get("p", m.get("b", 0))
-        m_f = m.get("f", m.get("j", 0))
-        m_c = m.get("c", m.get("u", 0))
+        m_title = (
+            m.get("title") or m.get("dish") or m.get("name") or
+            m.get("meal") or m.get("description") or m.get("text") or
+            m.get("items") or m.get("short_ingredients") or f"Прием пищи #{m_num}"
+        )
+        m_weight = m.get("weight") or m.get("grams") or m.get("portion") or "350 г"
+        m_p = m.get("p", m.get("b", m.get("protein", m.get("proteins", 0))))
+        m_f = m.get("f", m.get("j", m.get("fat", m.get("fats", 0))))
+        m_c = m.get("c", m.get("u", m.get("carbs", m.get("carbohydrates", 0))))
         text += (
             f"🍽 **{m_num}. {m_title}**\n"
             f"⚖️ Порция: {m_weight}\n"
@@ -1309,28 +1326,43 @@ async def cb_show_recipe(callback: CallbackQuery):
     u = get_user(uid)
     diet = json.loads(u["current_diet_json"])
     meal = diet["days"][d_idx]["meals"][m_idx]
-    cache = json.loads(u["recipes_cache_json"] or "{}")
-    cache_key = f"{d_idx}_{m_idx}_{meal['title']}"
+    if isinstance(meal, str):
+        meal = {"num": m_idx + 1, "title": meal}
 
-    if cache_key not in cache:
-        await safe_edit(callback.message, f"👨‍🍳 **Готовлю подробный пошаговый рецепт для:**\n_{meal['title']}_...")
-        prompt = (
-            f"Напиши простой, понятный и подробный пошаговый рецепт приготовления блюда:\n"
-            f"Блюдо: {meal['title']}\n"
-            f"Ингредиенты: {meal.get('short_ingredients', meal['title'])}\n"
-            f"Вес порции: {meal['weight']} (Б: {meal['p']}г, Ж: {meal['f']}г, У: {meal['c']}г).\n"
-            f"Распиши точные граммовки и шаги приготовления без воды."
-        )
-        rec_text = await ask_ai(prompt, temperature=0.3)
-        cache[cache_key] = rec_text
-        update_user(uid, recipes_cache_json=json.dumps(cache, ensure_ascii=False))
+    m_title = (
+        meal.get("title") or meal.get("dish") or meal.get("name") or
+        meal.get("meal") or meal.get("description") or meal.get("text") or f"Прием пищи #{m_idx + 1}"
+    )
+    m_weight = meal.get("weight") or meal.get("grams") or "350 г"
+    m_p = meal.get("p", meal.get("b", 30))
+    m_f = meal.get("f", meal.get("j", 15))
+    m_c = meal.get("c", meal.get("u", 50))
+    m_ingr = meal.get("short_ingredients") or m_title
+
+    if meal.get("recipe") and len(str(meal.get("recipe"))) > 30:
+        rec_text = meal["recipe"]
     else:
-        rec_text = cache[cache_key]
+        cache = json.loads(u["recipes_cache_json"] or "{}")
+        cache_key = f"{d_idx}_{m_idx}_{m_title}"
+        if cache_key not in cache:
+            await safe_edit(callback.message, f"👨‍🍳 **Готовлю подробный пошаговый рецепт для:**\n_{m_title}_...")
+            prompt = (
+                f"Напиши простой, понятный и подробный пошаговый рецепт приготовления блюда:\n"
+                f"Блюдо: {m_title}\n"
+                f"Ингредиенты: {m_ingr}\n"
+                f"Вес порции: {m_weight} (Б: {m_p}г, Ж: {m_f}г, У: {m_c}г).\n"
+                f"Распиши точные граммовки и шаги приготовления без воды."
+            )
+            rec_text = await ask_ai(prompt, temperature=0.3)
+            cache[cache_key] = rec_text
+            update_user(uid, recipes_cache_json=json.dumps(cache, ensure_ascii=False))
+        else:
+            rec_text = cache[cache_key]
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔙 Вернуться обратно", callback_data=f"viewday_{d_idx}")]
     ])
-    await safe_edit(callback.message, f"📖 **Рецепт: {meal['title']}**\n\n{rec_text}", kb)
+    await safe_edit(callback.message, f"📖 **Рецепт: {m_title}**\n\n{rec_text}", kb)
 
 @router.callback_query(F.data.startswith("repmeal_"))
 async def cb_replace_meal(callback: CallbackQuery):
@@ -1340,14 +1372,22 @@ async def cb_replace_meal(callback: CallbackQuery):
     u = get_user(uid)
     diet = json.loads(u["current_diet_json"])
     old_meal = diet["days"][d_idx]["meals"][m_idx]
+    if isinstance(old_meal, str):
+        old_meal = {"num": m_idx + 1, "title": old_meal}
 
-    await safe_edit(callback.message, f"🔄 **Подбираю простую и доступную замену вместо:**\n_{old_meal['title']}_...")
+    old_title = old_meal.get("title") or old_meal.get("dish") or old_meal.get("name") or f"Прием пищи #{m_idx + 1}"
+    old_num = old_meal.get("num", m_idx + 1)
+    old_p = old_meal.get("p", old_meal.get("b", 30))
+    old_f = old_meal.get("f", old_meal.get("j", 15))
+    old_c = old_meal.get("c", old_meal.get("u", 50))
+
+    await safe_edit(callback.message, f"🔄 **Подбираю простую и доступную замену вместо:**\n_{old_title}_...")
     prompt = f"""Замени этот прием пищи на другой из простых базовых продуктов (магазины: {u['stores']}, аллергии: {u['allergies']}).
-Старое блюдо (НЕ ПОВТОРЯТЬ): {old_meal['title']}
-Нужное БЖУ этого приема пищи: Белки ~{old_meal['p']}г, Жиры ~{old_meal['f']}г, Углеводы ~{old_meal['c']}г.
+Старое блюдо (НЕ ПОВТОРЯТЬ): {old_title}
+Ориентировочное БЖУ этого приема пищи: Белки ~{old_p}г, Жиры ~{old_f}г, Углеводы ~{old_c}г.
 Никаких дорогих или редких ингредиентов!
 Верни СТРОГО JSON одного приема пищи:
-{{"num": {old_meal['num']}, "title": "...", "weight": "...", "p": {old_meal['p']}, "f": {old_meal['f']}, "c": {old_meal['c']}, "short_ingredients": "..."}}"""
+{{"num": {old_num}, "title": "Полное название блюда и состав с граммовками", "weight": "350 г", "p": {old_p}, "f": {old_f}, "c": {old_c}, "short_ingredients": "..."}}"""
 
     res = await ask_ai(prompt, system="Отвечай строго валидным JSON.", temperature=0.5)
     try:
@@ -1630,7 +1670,7 @@ async def parse_products_with_ai(raw_text: str) -> list:
 async def prod_add_menu(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     webapp_url = (
-        f"{SCANNER_WEBAPP_URL}#bot={BOT_TOKEN}"
+        f"{SCANNER_WEBAPP_URL}?bot={BOT_TOKEN}"
         f"&or={OPENROUTER_API_KEY}"
         f"&cid={callback.message.chat.id}"
         f"&mid={callback.message.message_id}"
@@ -1725,6 +1765,8 @@ async def prod_add_process(message: Message, state: FSMContext):
 
 @router.message(ProductSG.waiting_voice_input, F.voice)
 async def prod_voice_process(message: Message, state: FSMContext):
+    import subprocess
+    import tempfile
     data = await state.get_data()
     prompt_mid = data.get("prompt_mid")
     await try_delete_user_msg(message)
@@ -1738,54 +1780,69 @@ async def prod_voice_process(message: Message, state: FSMContext):
     file_info = await bot.get_file(message.voice.file_id)
     bio = io.BytesIO()
     await bot.download_file(file_info.file_path, destination=bio)
-    b64_audio = base64.b64encode(bio.getvalue()).decode("utf-8")
+    ogg_bytes = bio.getvalue()
 
-    now_str = get_msk_now().strftime("%d.%m.%Y")
-    prompt = f"""Сегодняшняя дата: {now_str}.
-Прослушай голосовое сообщение пользователя и выдели все названные продукты и их сроки годности.
-Если пользователь говорит, например: "2 творога Твой день до 12.02.2026 и 3 до 15.02.2026", создай две записи:
-- {{"name": "Творог Твой день (2 шт.)", "date": "12.02.2026"}}
-- {{"name": "Творог Твой день (3 шт.)", "date": "15.02.2026"}}
-Ответь СТРОГО валидным JSON массивом объектов: [{{"name": "...", "date": "ДД.ММ.ГГГГ"}}]"""
+    def _transcribe_voice_sync() -> str:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ogg_path = os.path.join(tmpdir, "voice.ogg")
+            wav_path = os.path.join(tmpdir, "voice.wav")
+            with open(ogg_path, "wb") as f:
+                f.write(ogg_bytes)
 
-    def _call_audio_ai():
-        headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
-        for m_name in ["google/gemini-2.0-flash-exp:free", "google/gemini-2.0-flash-001"]:
-            try:
-                payload = {
-                    "model": m_name,
-                    "temperature": 0.1,
-                    "messages": [{
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {"type": "input_audio", "input_audio": {"data": b64_audio, "format": "ogg"}}
-                        ]
-                    }]
-                }
-                r = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=45)
-                if r.status_code == 200:
-                    return r.json()["choices"][0]["message"]["content"]
-            except Exception:
-                pass
+            # Конвертируем голосовой .ogg в чистый .wav
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", ogg_path, "-ar", "16000", "-ac", "1", wav_path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+
+            # 1. Точное распознавание русской речи через Google SpeechRecognition
+            if os.path.exists(wav_path):
+                try:
+                    import speech_recognition as sr
+                    rec = sr.Recognizer()
+                    with sr.AudioFile(wav_path) as source:
+                        audio_data = rec.record(source)
+                    text_ru = rec.recognize_google(audio_data, language="ru-RU")
+                    if text_ru:
+                        return text_ru.strip()
+                except Exception as e:
+                    logging.warning(f"SR error: {e}")
+
+            # 2. Резервный канал через мультимодальные модели OpenRouter (WAV)
+            if os.path.exists(wav_path):
+                with open(wav_path, "rb") as wf:
+                    b64_wav = base64.b64encode(wf.read()).decode("utf-8")
+                headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
+                for m_name in ["google/gemini-2.0-flash-exp:free", "google/gemini-2.0-flash-lite-preview-02-05:free"]:
+                    try:
+                        payload = {
+                            "model": m_name,
+                            "temperature": 0.1,
+                            "messages": [{
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": "Напиши дословно на русском языке, что сказано в аудиозаписи."},
+                                    {"type": "input_audio", "input_audio": {"data": b64_wav, "format": "wav"}}
+                                ]
+                            }]
+                        }
+                        r = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=40)
+                        if r.status_code == 200:
+                            ans = r.json()["choices"][0]["message"]["content"].strip()
+                            if ans:
+                                return ans
+                    except Exception:
+                        pass
         return ""
 
-    raw_ai = await asyncio.to_thread(_call_audio_ai)
+    spoken_text = await asyncio.to_thread(_transcribe_voice_sync)
     items = []
-    try:
-        arr = json.loads(clean_json_str(raw_ai))
-        for it in arr:
-            n = str(it.get("name", "")).strip()
-            d = str(it.get("date", "")).strip()
-            datetime.strptime(d, "%d.%m.%Y")
-            if n:
-                items.append({"name": n, "date": d})
-    except Exception:
-        items = []
+    if spoken_text:
+        items = await parse_products_with_ai(spoken_text)
 
     if not items:
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="prod_add")]])
-        err_msg = "⚠️ Не удалось разобрать продукты и даты в голосовом сообщении. Попробуйте записать ещё раз четко."
+        err_msg = "⚠️ Не удалось разобрать продукты и даты в голосовом сообщении. Попробуйте записать ещё раз."
         if prompt_mid:
             await bot.edit_message_text(err_msg, chat_id=message.chat.id, message_id=prompt_mid, reply_markup=kb)
         else:
